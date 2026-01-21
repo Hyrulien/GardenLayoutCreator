@@ -1,4 +1,5 @@
 export const ARIES_STORAGE_KEY = "aries_mod";
+const GLC_STORAGE_KEY = "glc_settings";
 
 type AnyRecord = Record<string, any>;
 
@@ -24,11 +25,34 @@ function readRoot(): AnyRecord {
   }
 }
 
+function readGlcRoot(): AnyRecord {
+  const storage = getStorage();
+  if (!storage) return {};
+  const raw = storage.getItem(GLC_STORAGE_KEY);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function writeRoot(next: AnyRecord) {
   const storage = getStorage();
   if (!storage) return;
   try {
     storage.setItem(ARIES_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // ignore
+  }
+}
+
+function writeGlcRoot(next: AnyRecord) {
+  const storage = getStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(GLC_STORAGE_KEY, JSON.stringify(next));
   } catch {
     // ignore
   }
@@ -68,10 +92,21 @@ export function readAriesPath<T = any>(path: string | Array<string | number>): T
   return getAtPath(root, toPath(path)) as T | undefined;
 }
 
+export function readGlcPath<T = any>(path: string | Array<string | number>): T | undefined {
+  const root = readGlcRoot();
+  return getAtPath(root, toPath(path)) as T | undefined;
+}
+
 export function writeAriesPath(path: string | Array<string | number>, value: any) {
   const root = readRoot();
   const next = setAtPath(root, toPath(path), value);
   writeRoot(next as AnyRecord);
+}
+
+export function writeGlcPath(path: string | Array<string | number>, value: any) {
+  const root = readGlcRoot();
+  const next = setAtPath(root, toPath(path), value);
+  writeGlcRoot(next as AnyRecord);
 }
 
 export function updateAriesPath(path: string | Array<string | number>, value: any) {

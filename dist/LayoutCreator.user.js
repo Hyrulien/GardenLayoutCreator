@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLC - Garden Layout Creator
 // @namespace    GLC
-// @version      v1.0.0
+// @version      v1.0.1
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -649,6 +649,7 @@
 
   // src/utils/localStorage.ts
   var ARIES_STORAGE_KEY = "aries_mod";
+  var GLC_STORAGE_KEY = "glc_settings";
   function getStorage() {
     if (typeof window === "undefined") return null;
     try {
@@ -669,11 +670,31 @@
       return {};
     }
   }
+  function readGlcRoot() {
+    const storage = getStorage();
+    if (!storage) return {};
+    const raw = storage.getItem(GLC_STORAGE_KEY);
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
   function writeRoot(next) {
     const storage = getStorage();
     if (!storage) return;
     try {
       storage.setItem(ARIES_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+    }
+  }
+  function writeGlcRoot(next) {
+    const storage = getStorage();
+    if (!storage) return;
+    try {
+      storage.setItem(GLC_STORAGE_KEY, JSON.stringify(next));
     } catch {
     }
   }
@@ -707,10 +728,19 @@
     const root = readRoot();
     return getAtPath(root, toPath(path));
   }
+  function readGlcPath(path) {
+    const root = readGlcRoot();
+    return getAtPath(root, toPath(path));
+  }
   function writeAriesPath(path, value) {
     const root = readRoot();
     const next = setAtPath(root, toPath(path), value);
     writeRoot(next);
+  }
+  function writeGlcPath(path, value) {
+    const root = readGlcRoot();
+    const next = setAtPath(root, toPath(path), value);
+    writeGlcRoot(next);
   }
   function updateAriesPath(path, value) {
     writeAriesPath(path, value);
@@ -788,11 +818,20 @@
     const HIDE_MENU_PATH = "glc.settings.hideMenu";
     const HIDE_MENU_KEY = "glc.settings.hideMenu";
     const readHideMenuSetting = () => {
-      const stored = readAriesPath(HIDE_MENU_PATH);
+      const stored = readGlcPath(HIDE_MENU_PATH);
       if (typeof stored === "boolean") return stored;
+      const legacyAries = readAriesPath(HIDE_MENU_PATH);
+      if (typeof legacyAries === "boolean") {
+        writeGlcPath(HIDE_MENU_PATH, legacyAries);
+        return legacyAries;
+      }
       try {
         const raw = window.localStorage?.getItem(HIDE_MENU_KEY);
-        if (raw != null) return raw === "1" || raw === "true";
+        if (raw != null) {
+          const parsed = raw === "1" || raw === "true";
+          writeGlcPath(HIDE_MENU_PATH, parsed);
+          return parsed;
+        }
       } catch {
       }
       return false;
@@ -3355,6 +3394,8 @@
   var _captureInProgress = false;
   var _captureError = null;
   var _lastCapturedVia = null;
+  var _warnedWriteOnceTimeout = false;
+  var _retryListenersInstalled = false;
   var getAtomCache = () => pageWindow.jotaiAtomCache?.cache;
   function findStoreViaFiber() {
     const hook = pageWindow.__REACT_DEVTOOLS_GLOBAL_HOOK__;
@@ -3382,7 +3423,7 @@
     }
     return null;
   }
-  async function captureViaWriteOnce(timeoutMs = 5e3) {
+  async function captureViaWriteOnce(timeoutMs = 5e3, allowReschedule = true) {
     const cache = getAtomCache();
     if (!cache) {
       console.warn("[GLC jotai-bridge] jotaiAtomCache.cache introuvable");
@@ -3428,7 +3469,11 @@
     if (!capturedSet) {
       restorePatched();
       _lastCapturedVia = "polyfill";
-      console.warn("[GLC jotai-bridge] write-once: timeout \u2192 polyfill");
+      if (!_warnedWriteOnceTimeout) {
+        _warnedWriteOnceTimeout = true;
+        console.warn("[GLC jotai-bridge] write-once: timeout \u2192 polyfill");
+      }
+      if (allowReschedule) scheduleRetryCapture();
       return {
         get: () => {
           throw new Error("Store non captur\xE9: get indisponible");
@@ -3469,6 +3514,40 @@
         return () => clearInterval(id);
       }
     };
+  }
+  function scheduleRetryCapture() {
+    if (_retryListenersInstalled || typeof window === "undefined") return;
+    _retryListenersInstalled = true;
+    const trigger = async () => {
+      if (!_retryListenersInstalled) return;
+      _retryListenersInstalled = false;
+      try {
+        window.removeEventListener("keydown", onEvent, true);
+        window.removeEventListener("pointerdown", onEvent, true);
+        window.removeEventListener("visibilitychange", onEvent, true);
+      } catch {
+      }
+      try {
+        const viaFiber = findStoreViaFiber();
+        if (viaFiber) {
+          _store = viaFiber;
+          _lastCapturedVia = "fiber";
+          return;
+        }
+        const viaWrite = await captureViaWriteOnce(4e3, false);
+        if (!viaWrite.__polyfill) {
+          _store = viaWrite;
+        }
+      } catch {
+      }
+    };
+    const onEvent = () => {
+      void trigger();
+    };
+    window.addEventListener("keydown", onEvent, true);
+    window.addEventListener("pointerdown", onEvent, true);
+    window.addEventListener("visibilitychange", onEvent, true);
+    setTimeout(() => void trigger(), 2e3);
   }
   async function ensureStore() {
     if (_store && !_store.__polyfill) return _store;
@@ -7118,10 +7197,51 @@
     }
     return chunks;
   }
+  async function calculatePlanterPotsNeeded(garden, currentGarden) {
+    const ignoredDirt = getIgnoredSet(garden, "Dirt");
+    const aliasMap = getPlantAliasMap();
+    let potsNeeded = 0;
+    for (const [key, draftObj] of Object.entries(garden.tileObjects || {})) {
+      const idx = Number(key);
+      if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+      if (!draftObj || typeof draftObj !== "object") continue;
+      const curObj = (currentGarden.tileObjects || {})[key];
+      if (!curObj || typeof curObj !== "object") continue;
+      const curType = String(curObj.objectType || "").toLowerCase();
+      if (curType === "plant") {
+        const draftType = String(draftObj.objectType || "").toLowerCase();
+        if (draftType === "plant") {
+          const curSpecies = resolvePlantSpeciesKey(String(curObj.species || curObj.seedKey || ""), aliasMap);
+          const draftSpecies = resolvePlantSpeciesKey(String(draftObj.species || draftObj.seedKey || ""), aliasMap);
+          if (curSpecies !== draftSpecies) {
+            potsNeeded += 1;
+          }
+        } else {
+          potsNeeded += 1;
+        }
+      }
+    }
+    return potsNeeded;
+  }
   async function applyGardenServerWithPotting(garden, blocked, opts) {
     const initialGarden = await getCurrentGarden();
     if (!initialGarden) return false;
     let currentGarden = initialGarden;
+    const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
+    if (potsNeeded > 0) {
+      const inventory = await getInventoryCounts();
+      const potsOwned = inventory.tools.get("Planter Pot") || 0;
+      if (potsNeeded > potsOwned) {
+        const missing = potsNeeded - potsOwned;
+        await toastSimple(
+          "Garden Layout",
+          `To apply this Layout you need ${potsNeeded} Planter Pots, you're missing ${missing} Planter Pots`,
+          "error",
+          4e3
+        );
+        return false;
+      }
+    }
     const rawSlots = Number(opts.inventorySlotsAvailable ?? 0);
     const configuredSlots = Number.isFinite(rawSlots) && rawSlots >= 1 ? Math.floor(rawSlots) : 10;
     let freeSlotInfo = await resolveInventoryFreeSlots();
@@ -7989,7 +8109,8 @@
       seeds: /* @__PURE__ */ new Map(),
       plants: /* @__PURE__ */ new Map(),
       decors: /* @__PURE__ */ new Map(),
-      eggs: /* @__PURE__ */ new Map()
+      eggs: /* @__PURE__ */ new Map(),
+      tools: /* @__PURE__ */ new Map()
     };
     try {
       const inventory = await Store.select("myInventoryAtom");
@@ -8017,6 +8138,9 @@
         } else if (type === "egg") {
           const eggId = String(source.eggId ?? source.data?.eggId ?? "");
           if (eggId) addCount(counts.eggs, eggId, quantity);
+        } else if (type === "tool" || type === "item") {
+          const itemName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
+          if (itemName) addCount(counts.tools, itemName, quantity);
         }
       }
     } catch {
@@ -8965,13 +9089,13 @@
     const getMutationDisplayName = (id) => mutationCatalog[id]?.name || id;
     const MUTATION_OUTLINES = {
       Gold: { border: "#f5d44b", shadow: "0 0 0 2px rgba(245,212,75,0.6) inset" },
-      Rainbow: { border: "transparent", shadow: "none" },
+      Rainbow: { border: "transparent", shadow: "0 0 0 2px rgba(255,255,255,0.3) inset" },
       Frozen: { border: "#8fd9ff", shadow: "0 0 0 2px rgba(143,217,255,0.6) inset" },
       Chilled: { border: "#f0f4ff", shadow: "0 0 0 2px rgba(240,244,255,0.7) inset" },
       Wet: { border: "#5aa9ff", shadow: "0 0 0 2px rgba(90,169,255,0.6) inset" },
-      Dawnlit: { border: "#ffb86c", shadow: "0 0 0 2px rgba(255,184,108,0.6) inset" },
+      Dawnlit: { border: "#a78bfa", shadow: "0 0 0 2px rgba(167,139,250,0.6) inset" },
       Amberlit: { border: "#ff9f4a", shadow: "0 0 0 2px rgba(255,159,74,0.6) inset" },
-      Dawncharged: { border: "#ff9161", shadow: "0 0 0 2px rgba(255,145,97,0.6) inset" },
+      Dawncharged: { border: "#8b5cf6", shadow: "0 0 0 2px rgba(139,92,246,0.6) inset" },
       Ambercharged: { border: "#ff7b2e", shadow: "0 0 0 2px rgba(255,123,46,0.6) inset" }
     };
     const fillSelect = (el2, items, label, getLabel) => {
@@ -9219,12 +9343,12 @@
         launcher.style.display = anyVisible ? "" : "none";
       }
     };
-    const initialHideMenu = !!readAriesPath(HIDE_MENU_PATH);
+    const initialHideMenu = !!readGlcPath(HIDE_MENU_PATH);
     hideMenuToggle.checked = initialHideMenu;
     setLauncherHidden(initialHideMenu);
     hideMenuToggle.addEventListener("change", () => {
       const hidden = hideMenuToggle.checked;
-      writeAriesPath(HIDE_MENU_PATH, hidden);
+      writeGlcPath(HIDE_MENU_PATH, hidden);
       setLauncherHidden(hidden);
     });
     const draftActionsRow = document.createElement("div");
@@ -9557,6 +9681,36 @@
           setBadge(localVersion || "Unknown", "warn");
         }
       })();
+      const applyHeaderBtn = document.createElement("button");
+      applyHeaderBtn.className = "w-btn";
+      applyHeaderBtn.dataset.act = "apply";
+      applyHeaderBtn.title = "Apply current layout";
+      applyHeaderBtn.textContent = "\u25B6";
+      applyHeaderBtn.addEventListener("click", async () => {
+        const slotsAvailable = normalizeInventorySlots(Number(inventoryInput.value));
+        inventoryInput.value = String(slotsAvailable);
+        const ok = await GardenLayoutService.applyGarden(draft, {
+          ignoreInventory: EditorService.isEnabled(),
+          clearTargetTiles: true,
+          inventorySlotsAvailable: Number.isFinite(slotsAvailable) ? Math.max(0, Math.floor(slotsAvailable)) : 0
+        });
+        if (!ok) return;
+        if (!clearLeftToggle.checked && !clearRightToggle.checked) return;
+        const slotsLimit = Number.isFinite(slotsAvailable) ? Math.max(0, Math.floor(slotsAvailable)) : 0;
+        if (slotsLimit <= 0) return;
+        const { tasks, blocked } = await GardenLayoutService.getClearSideTasks(draft, {
+          clearLeft: clearLeftToggle.checked,
+          clearRight: clearRightToggle.checked
+        });
+        if (!tasks.length) return;
+        if (tasks.length > slotsLimit) {
+          const proceed = window.confirm(
+            `Clearing ${tasks.length} items needs ${slotsLimit} free slots. Only ${slotsLimit} items will be picked up. Continue?`
+          );
+          if (!proceed) return;
+        }
+        await GardenLayoutService.clearSideTasks(tasks, slotsLimit);
+      });
       const halfButton = document.createElement("button");
       halfButton.className = "w-btn";
       halfButton.dataset.act = "half";
@@ -9610,9 +9764,10 @@
       if (minBtn) {
         windowHead.insertBefore(versionBadge, minBtn);
         windowHead.insertBefore(gearButton, minBtn);
+        windowHead.insertBefore(applyHeaderBtn, minBtn);
         windowHead.insertBefore(halfButton, minBtn);
       } else {
-        windowHead.append(versionBadge, gearButton, halfButton);
+        windowHead.append(versionBadge, gearButton, applyHeaderBtn, halfButton);
       }
     }
     layoutCard.root.append(settingsPanel);
@@ -9664,6 +9819,10 @@
       Dirt: /* @__PURE__ */ new Set(),
       Boardwalk: /* @__PURE__ */ new Set()
     };
+    let clearMarkedTiles = {
+      Dirt: /* @__PURE__ */ new Set(),
+      Boardwalk: /* @__PURE__ */ new Set()
+    };
     let isDragging = false;
     let dragMode = "apply";
     let clearDragActive = false;
@@ -9687,6 +9846,37 @@
     const isIgnoredTile = (idx) => ignoredTilesByType[currentKind].has(idx);
     const isEggTile = (idx) => liveEggTiles[currentKind].has(idx);
     syncIgnoredFromDraft();
+    const updateClearMarkers = async () => {
+      if (!clearLeftToggle.checked && !clearRightToggle.checked) {
+        clearMarkedTiles.Dirt.clear();
+        clearMarkedTiles.Boardwalk.clear();
+        for (const idx of tileCells.keys()) {
+          updateTileCell(idx);
+        }
+        return;
+      }
+      try {
+        const { tasks } = await GardenLayoutService.getClearSideTasks(draft, {
+          clearLeft: clearLeftToggle.checked,
+          clearRight: clearRightToggle.checked
+        });
+        const dirtSet = /* @__PURE__ */ new Set();
+        const boardSet = /* @__PURE__ */ new Set();
+        for (const task of tasks) {
+          if (task.tileType === "Dirt") {
+            dirtSet.add(task.localIdx);
+          } else {
+            boardSet.add(task.localIdx);
+          }
+        }
+        clearMarkedTiles.Dirt = dirtSet;
+        clearMarkedTiles.Boardwalk = boardSet;
+        for (const idx of tileCells.keys()) {
+          updateTileCell(idx);
+        }
+      } catch {
+      }
+    };
     const setLayoutStatus = (msg) => {
       layoutStatus.textContent = msg;
     };
@@ -9992,6 +10182,25 @@
           eggIcon.style.alignItems = "center";
           eggIcon.style.justifyContent = "center";
           cell.appendChild(eggIcon);
+          const clearIcon = document.createElement("div");
+          clearIcon.className = "glc-tile-clear";
+          clearIcon.style.position = "absolute";
+          clearIcon.style.top = "0";
+          clearIcon.style.left = "0";
+          clearIcon.style.width = "100%";
+          clearIcon.style.height = "100%";
+          clearIcon.style.display = "none";
+          clearIcon.style.alignItems = "center";
+          clearIcon.style.justifyContent = "center";
+          clearIcon.style.background = "rgba(255,50,50,0.3)";
+          clearIcon.style.borderRadius = "8px";
+          clearIcon.style.fontSize = "16px";
+          clearIcon.style.fontWeight = "bold";
+          clearIcon.style.color = "#ff3030";
+          clearIcon.style.pointerEvents = "none";
+          clearIcon.style.zIndex = "2";
+          clearIcon.textContent = "\u2715";
+          cell.appendChild(clearIcon);
           tileCells.set(tile.localIdx, cell);
           const applySelectedItemToTile = () => {
             const type = typeSelect.value;
@@ -10181,8 +10390,14 @@
           }
         }
       }
+      const clearIcon = cell.querySelector(".glc-tile-clear");
+      if (clearIcon) {
+        const isMarkedForClear = clearMarkedTiles[currentKind].has(idx);
+        clearIcon.style.display = isMarkedForClear ? "flex" : "none";
+      }
       const occupied = !!obj;
       const mutation = obj && typeof obj === "object" && typeof obj.glcMutation === "string" ? GardenLayoutService.normalizeMutation(String(obj.glcMutation)) : "";
+      const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
       cell.style.borderImage = "none";
       cell.style.borderImageSlice = "";
       if (isIgnoredTile(idx)) {
@@ -10197,20 +10412,24 @@
       } else if (blockedTiles.has(idx)) {
         cell.style.borderColor = "#f5c542";
         cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-      } else if (missingPlantTiles.has(idx)) {
-        cell.style.borderColor = "#ff6b6b";
-        cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
-      } else if (missingDecorTiles.has(`${currentKind}:${idx}`)) {
-        cell.style.borderColor = "#ff6b6b";
-        cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
       } else if (mutation && MUTATION_OUTLINES[mutation]) {
         const outline = MUTATION_OUTLINES[mutation];
         cell.style.borderColor = outline.border;
-        cell.style.boxShadow = outline.shadow;
-        if (mutation === "Rainbow") {
-          cell.style.borderImage = "linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
-          cell.style.borderImageSlice = "1";
+        if (isMissing) {
+          cell.style.boxShadow = `${outline.shadow}, 0 0 8px 2px rgba(255,107,107,0.8)`;
+        } else {
+          cell.style.boxShadow = outline.shadow;
         }
+        if (mutation === "Rainbow") {
+          cell.style.border = "2px solid transparent";
+          cell.style.borderRadius = "8px";
+          cell.style.backgroundImage = "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
+          cell.style.backgroundOrigin = "border-box";
+          cell.style.backgroundClip = "padding-box, border-box";
+        }
+      } else if (isMissing) {
+        cell.style.borderColor = "#ff6b6b";
+        cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
       } else if (occupied) {
         cell.style.borderColor = "#4a7dff";
         cell.style.boxShadow = "0 0 0 1px rgba(74,125,255,0.6) inset";
@@ -10473,12 +10692,6 @@
             }
           }
         });
-        const apply = ui.btn("Apply", {
-          size: "md",
-          onClick: async () => {
-            await GardenLayoutService.applySavedLayout(g.id, { ignoreInventory: EditorService.isEnabled() });
-          }
-        });
         const del = ui.btn("Delete", {
           size: "md",
           variant: "danger",
@@ -10494,7 +10707,7 @@
         nameWrap.style.justifyItems = "center";
         nameWrap.style.textAlign = "center";
         nameWrap.append(name, nameInput);
-        row.append(nameWrap, edit, save, apply, del);
+        row.append(nameWrap, edit, save, del);
         savedLayoutsWrap.appendChild(row);
       }
       layoutsNaturalHeight = 0;
@@ -10698,6 +10911,12 @@
     renderMutationPickerGrid();
     mutationPickerBtn.addEventListener("click", () => {
       mutationPickerGrid.style.display = mutationPickerGrid.style.display === "none" ? "grid" : "none";
+    });
+    clearLeftToggle.addEventListener("change", () => {
+      void updateClearMarkers();
+    });
+    clearRightToggle.addEventListener("change", () => {
+      void updateClearMarkers();
     });
     setActiveTab("Dirt");
     updateSelectionLabel();

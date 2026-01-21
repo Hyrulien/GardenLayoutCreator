@@ -1,5 +1,5 @@
 import { i18n } from "../utils/i18n";
-import { readAriesPath, writeAriesPath } from "../utils/localStorage";
+import { readAriesPath, readGlcPath, writeAriesPath, writeGlcPath } from "../utils/localStorage";
 
 export type PanelRender = (root: HTMLElement) => void;
 export interface HUDOptions {
@@ -81,11 +81,20 @@ export function mountHUD(opts?: HUDOptions) {
   const HIDE_MENU_PATH = "glc.settings.hideMenu";
   const HIDE_MENU_KEY = "glc.settings.hideMenu";
   const readHideMenuSetting = () => {
-    const stored = readAriesPath<boolean>(HIDE_MENU_PATH);
+    const stored = readGlcPath<boolean>(HIDE_MENU_PATH);
     if (typeof stored === "boolean") return stored;
+    const legacyAries = readAriesPath<boolean>(HIDE_MENU_PATH);
+    if (typeof legacyAries === "boolean") {
+      writeGlcPath(HIDE_MENU_PATH, legacyAries);
+      return legacyAries;
+    }
     try {
       const raw = window.localStorage?.getItem(HIDE_MENU_KEY);
-      if (raw != null) return raw === "1" || raw === "true";
+      if (raw != null) {
+        const parsed = raw === "1" || raw === "true";
+        writeGlcPath(HIDE_MENU_PATH, parsed);
+        return parsed;
+      }
     } catch {
       /* ignore storage access errors */
     }

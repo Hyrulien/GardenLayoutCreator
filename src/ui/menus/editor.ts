@@ -7,7 +7,7 @@ import { decorCatalog, eggCatalog, mutationCatalog, plantCatalog } from "../../d
 import { fetchRemoteVersion, getLocalVersion } from "../../utils/version";
 import { isDiscordSurface } from "../../utils/api";
 import { getKeybind, onKeybindChange, setKeybind } from "../../services/keybinds";
-import { readAriesPath, writeAriesPath } from "../../utils/localStorage";
+import { readAriesPath, readGlcPath, writeAriesPath, writeGlcPath } from "../../utils/localStorage";
 import { pageWindow } from "../../utils/page-context";
 
 export function renderEditorMenu(container: HTMLElement) {
@@ -233,13 +233,13 @@ export function renderEditorMenu(container: HTMLElement) {
   const getMutationDisplayName = (id: string) => mutationCatalog[id as keyof typeof mutationCatalog]?.name || id;
   const MUTATION_OUTLINES: Record<string, { border: string; shadow: string }> = {
     Gold: { border: "#f5d44b", shadow: "0 0 0 2px rgba(245,212,75,0.6) inset" },
-    Rainbow: { border: "transparent", shadow: "none" },
+    Rainbow: { border: "transparent", shadow: "0 0 0 2px rgba(255,255,255,0.3) inset" },
     Frozen: { border: "#8fd9ff", shadow: "0 0 0 2px rgba(143,217,255,0.6) inset" },
     Chilled: { border: "#f0f4ff", shadow: "0 0 0 2px rgba(240,244,255,0.7) inset" },
     Wet: { border: "#5aa9ff", shadow: "0 0 0 2px rgba(90,169,255,0.6) inset" },
-    Dawnlit: { border: "#ffb86c", shadow: "0 0 0 2px rgba(255,184,108,0.6) inset" },
+    Dawnlit: { border: "#a78bfa", shadow: "0 0 0 2px rgba(167,139,250,0.6) inset" },
     Amberlit: { border: "#ff9f4a", shadow: "0 0 0 2px rgba(255,159,74,0.6) inset" },
-    Dawncharged: { border: "#ff9161", shadow: "0 0 0 2px rgba(255,145,97,0.6) inset" },
+    Dawncharged: { border: "#8b5cf6", shadow: "0 0 0 2px rgba(139,92,246,0.6) inset" },
     Ambercharged: { border: "#ff7b2e", shadow: "0 0 0 2px rgba(255,123,46,0.6) inset" },
   };
   const fillSelect = (
@@ -515,12 +515,12 @@ export function renderEditorMenu(container: HTMLElement) {
       launcher.style.display = anyVisible ? "" : "none";
     }
   };
-  const initialHideMenu = !!readAriesPath<boolean>(HIDE_MENU_PATH);
+  const initialHideMenu = !!readGlcPath<boolean>(HIDE_MENU_PATH);
   hideMenuToggle.checked = initialHideMenu;
   setLauncherHidden(initialHideMenu);
   hideMenuToggle.addEventListener("change", () => {
     const hidden = hideMenuToggle.checked;
-    writeAriesPath(HIDE_MENU_PATH, hidden);
+    writeGlcPath(HIDE_MENU_PATH, hidden);
     setLauncherHidden(hidden);
   });
 
@@ -881,6 +881,37 @@ export function renderEditorMenu(container: HTMLElement) {
         setBadge(localVersion || "Unknown", "warn");
       }
     })();
+    const applyHeaderBtn = document.createElement("button");
+    applyHeaderBtn.className = "w-btn";
+    applyHeaderBtn.dataset.act = "apply";
+    applyHeaderBtn.title = "Apply current layout";
+    applyHeaderBtn.textContent = "▶";
+    applyHeaderBtn.addEventListener("click", async () => {
+      const slotsAvailable = normalizeInventorySlots(Number(inventoryInput.value));
+      inventoryInput.value = String(slotsAvailable);
+      const ok = await GardenLayoutService.applyGarden(draft, {
+        ignoreInventory: EditorService.isEnabled(),
+        clearTargetTiles: true,
+        inventorySlotsAvailable: Number.isFinite(slotsAvailable) ? Math.max(0, Math.floor(slotsAvailable)) : 0,
+      });
+      if (!ok) return;
+      if (!clearLeftToggle.checked && !clearRightToggle.checked) return;
+      const slotsLimit = Number.isFinite(slotsAvailable) ? Math.max(0, Math.floor(slotsAvailable)) : 0;
+      if (slotsLimit <= 0) return;
+      const { tasks, blocked } = await GardenLayoutService.getClearSideTasks(draft, {
+        clearLeft: clearLeftToggle.checked,
+        clearRight: clearRightToggle.checked,
+      });
+      if (!tasks.length) return;
+      if (tasks.length > slotsLimit) {
+        const proceed = window.confirm(
+          `Clearing ${tasks.length} items needs ${slotsLimit} free slots. Only ${slotsLimit} items will be picked up. Continue?`
+        );
+        if (!proceed) return;
+      }
+      await GardenLayoutService.clearSideTasks(tasks, slotsLimit);
+    });
+
     const halfButton = document.createElement("button");
     halfButton.className = "w-btn";
     halfButton.dataset.act = "half";
@@ -938,9 +969,10 @@ export function renderEditorMenu(container: HTMLElement) {
     if (minBtn) {
       windowHead.insertBefore(versionBadge, minBtn);
       windowHead.insertBefore(gearButton, minBtn);
+      windowHead.insertBefore(applyHeaderBtn, minBtn);
       windowHead.insertBefore(halfButton, minBtn);
     } else {
-      windowHead.append(versionBadge, gearButton, halfButton);
+      windowHead.append(versionBadge, gearButton, applyHeaderBtn, halfButton);
     }
   }
 
@@ -998,6 +1030,10 @@ export function renderEditorMenu(container: HTMLElement) {
     Dirt: new Set(),
     Boardwalk: new Set(),
   };
+  let clearMarkedTiles: Record<"Dirt" | "Boardwalk", Set<number>> = {
+    Dirt: new Set(),
+    Boardwalk: new Set(),
+  };
   let isDragging = false;
   let dragMode: "apply" | "clear" | "ignore-add" | "ignore-remove" | "mutation-clear" = "apply";
   let clearDragActive = false;
@@ -1021,6 +1057,39 @@ export function renderEditorMenu(container: HTMLElement) {
   const isIgnoredTile = (idx: number) => ignoredTilesByType[currentKind].has(idx);
   const isEggTile = (idx: number) => liveEggTiles[currentKind].has(idx);
   syncIgnoredFromDraft();
+
+  const updateClearMarkers = async () => {
+    if (!clearLeftToggle.checked && !clearRightToggle.checked) {
+      clearMarkedTiles.Dirt.clear();
+      clearMarkedTiles.Boardwalk.clear();
+      for (const idx of tileCells.keys()) {
+        updateTileCell(idx);
+      }
+      return;
+    }
+    try {
+      const { tasks } = await GardenLayoutService.getClearSideTasks(draft, {
+        clearLeft: clearLeftToggle.checked,
+        clearRight: clearRightToggle.checked,
+      });
+      const dirtSet = new Set<number>();
+      const boardSet = new Set<number>();
+      for (const task of tasks) {
+        if (task.tileType === "Dirt") {
+          dirtSet.add(task.localIdx);
+        } else {
+          boardSet.add(task.localIdx);
+        }
+      }
+      clearMarkedTiles.Dirt = dirtSet;
+      clearMarkedTiles.Boardwalk = boardSet;
+      for (const idx of tileCells.keys()) {
+        updateTileCell(idx);
+      }
+    } catch {
+      // ignore errors
+    }
+  };
 
   const setLayoutStatus = (msg: string) => {
     layoutStatus.textContent = msg;
@@ -1354,6 +1423,27 @@ export function renderEditorMenu(container: HTMLElement) {
         eggIcon.style.alignItems = "center";
         eggIcon.style.justifyContent = "center";
         cell.appendChild(eggIcon);
+
+        const clearIcon = document.createElement("div");
+        clearIcon.className = "glc-tile-clear";
+        clearIcon.style.position = "absolute";
+        clearIcon.style.top = "0";
+        clearIcon.style.left = "0";
+        clearIcon.style.width = "100%";
+        clearIcon.style.height = "100%";
+        clearIcon.style.display = "none";
+        clearIcon.style.alignItems = "center";
+        clearIcon.style.justifyContent = "center";
+        clearIcon.style.background = "rgba(255,50,50,0.3)";
+        clearIcon.style.borderRadius = "8px";
+        clearIcon.style.fontSize = "16px";
+        clearIcon.style.fontWeight = "bold";
+        clearIcon.style.color = "#ff3030";
+        clearIcon.style.pointerEvents = "none";
+        clearIcon.style.zIndex = "2";
+        clearIcon.textContent = "✕";
+        cell.appendChild(clearIcon);
+
         tileCells.set(tile.localIdx, cell);
 
         const applySelectedItemToTile = () => {
@@ -1556,11 +1646,19 @@ export function renderEditorMenu(container: HTMLElement) {
       }
     }
 
+    const clearIcon = cell.querySelector<HTMLDivElement>(".glc-tile-clear");
+    if (clearIcon) {
+      const isMarkedForClear = clearMarkedTiles[currentKind].has(idx);
+      clearIcon.style.display = isMarkedForClear ? "flex" : "none";
+    }
+
     const occupied = !!obj;
     const mutation =
       obj && typeof obj === "object" && typeof (obj as any).glcMutation === "string"
         ? GardenLayoutService.normalizeMutation(String((obj as any).glcMutation))
         : "";
+    const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
+    
     cell.style.borderImage = "none";
     cell.style.borderImageSlice = "";
     if (isIgnoredTile(idx)) {
@@ -1575,20 +1673,25 @@ export function renderEditorMenu(container: HTMLElement) {
     } else if (blockedTiles.has(idx)) {
       cell.style.borderColor = "#f5c542";
       cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-    } else if (missingPlantTiles.has(idx)) {
-      cell.style.borderColor = "#ff6b6b";
-      cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
-    } else if (missingDecorTiles.has(`${currentKind}:${idx}`)) {
-      cell.style.borderColor = "#ff6b6b";
-      cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
     } else if (mutation && MUTATION_OUTLINES[mutation]) {
       const outline = MUTATION_OUTLINES[mutation];
       cell.style.borderColor = outline.border;
-      cell.style.boxShadow = outline.shadow;
-      if (mutation === "Rainbow") {
-        cell.style.borderImage = "linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
-        cell.style.borderImageSlice = "1";
+      if (isMissing) {
+        // Mutation + missing: show mutation color with red outer glow
+        cell.style.boxShadow = `${outline.shadow}, 0 0 8px 2px rgba(255,107,107,0.8)`;
+      } else {
+        cell.style.boxShadow = outline.shadow;
       }
+      if (mutation === "Rainbow") {
+        cell.style.border = "2px solid transparent";
+        cell.style.borderRadius = "8px";
+        cell.style.backgroundImage = "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
+        cell.style.backgroundOrigin = "border-box";
+        cell.style.backgroundClip = "padding-box, border-box";
+      }
+    } else if (isMissing) {
+      cell.style.borderColor = "#ff6b6b";
+      cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
     } else if (occupied) {
       cell.style.borderColor = "#4a7dff";
       cell.style.boxShadow = "0 0 0 1px rgba(74,125,255,0.6) inset";
@@ -1877,12 +1980,6 @@ export function renderEditorMenu(container: HTMLElement) {
           }
         },
       });
-      const apply = ui.btn("Apply", {
-        size: "md",
-        onClick: async () => {
-          await GardenLayoutService.applySavedLayout(g.id, { ignoreInventory: EditorService.isEnabled() });
-        },
-      });
       const del = ui.btn("Delete", {
         size: "md",
         variant: "danger",
@@ -1899,7 +1996,7 @@ export function renderEditorMenu(container: HTMLElement) {
       nameWrap.style.justifyItems = "center";
       nameWrap.style.textAlign = "center";
       nameWrap.append(name, nameInput);
-      row.append(nameWrap, edit, save, apply, del);
+      row.append(nameWrap, edit, save, del);
       savedLayoutsWrap.appendChild(row);
     }
     layoutsNaturalHeight = 0;
@@ -2122,6 +2219,13 @@ export function renderEditorMenu(container: HTMLElement) {
   mutationPickerBtn.addEventListener("click", () => {
     mutationPickerGrid.style.display = mutationPickerGrid.style.display === "none" ? "grid" : "none";
   });
+  clearLeftToggle.addEventListener("change", () => {
+    void updateClearMarkers();
+  });
+  clearRightToggle.addEventListener("change", () => {
+    void updateClearMarkers();
+  });
+
   setActiveTab("Dirt");
   updateSelectionLabel();
   renderSavedLayouts();

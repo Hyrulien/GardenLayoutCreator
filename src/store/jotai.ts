@@ -15,6 +15,8 @@ let _store: JotaiStore | null = null;
 let _captureInProgress = false;
 let _captureError: unknown = null;
 let _lastCapturedVia: "fiber" | "write" | "polyfill" | null = null;
+let _warnedWriteOnceTimeout = false;
+let _retryListenersInstalled = false;
 
 const getAtomCache = () =>
   (pageWindow as any).jotaiAtomCache?.cache as Map<any, any> | undefined;
@@ -63,7 +65,7 @@ function findStoreViaFiber(): JotaiStore | null {
  * Fallback: capture store by temporarily patching atoms' write() to grab (get,set).
  * If nothing writes within timeout, returns a polyfilled store (read-only error).
  */
-async function captureViaWriteOnce(timeoutMs = 5000): Promise<JotaiStore> {
+async function captureViaWriteOnce(timeoutMs = 5000, allowReschedule = true): Promise<JotaiStore> {
   const cache = getAtomCache();
   if (!cache) {
     console.warn("[GLC jotai-bridge] jotaiAtomCache.cache introuvable");
@@ -118,7 +120,11 @@ async function captureViaWriteOnce(timeoutMs = 5000): Promise<JotaiStore> {
   if (!capturedSet) {
     restorePatched();
     _lastCapturedVia = "polyfill";
-    console.warn("[GLC jotai-bridge] write-once: timeout → polyfill");
+    if (!_warnedWriteOnceTimeout) {
+      _warnedWriteOnceTimeout = true;
+      console.warn("[GLC jotai-bridge] write-once: timeout → polyfill");
+    }
+    if (allowReschedule) scheduleRetryCapture();
     return {
       get: () => {
         throw new Error("Store non capturé: get indisponible");
@@ -157,6 +163,43 @@ async function captureViaWriteOnce(timeoutMs = 5000): Promise<JotaiStore> {
       return () => clearInterval(id as any);
     },
   };
+}
+
+function scheduleRetryCapture() {
+  if (_retryListenersInstalled || typeof window === "undefined") return;
+  _retryListenersInstalled = true;
+
+  const trigger = async () => {
+    if (!_retryListenersInstalled) return;
+    _retryListenersInstalled = false;
+    try {
+      window.removeEventListener("keydown", onEvent, true);
+      window.removeEventListener("pointerdown", onEvent, true);
+      window.removeEventListener("visibilitychange", onEvent, true);
+    } catch {}
+
+    try {
+      const viaFiber = findStoreViaFiber();
+      if (viaFiber) {
+        _store = viaFiber;
+        _lastCapturedVia = "fiber";
+        return;
+      }
+      const viaWrite = await captureViaWriteOnce(4000, false);
+      if (!viaWrite.__polyfill) {
+        _store = viaWrite;
+      }
+    } catch {}
+  };
+
+  const onEvent = () => {
+    void trigger();
+  };
+
+  window.addEventListener("keydown", onEvent, true);
+  window.addEventListener("pointerdown", onEvent, true);
+  window.addEventListener("visibilitychange", onEvent, true);
+  setTimeout(() => void trigger(), 2000);
 }
 
 /** Ensure we have a store captured (fiber → write → polyfill). */

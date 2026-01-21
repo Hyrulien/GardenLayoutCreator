@@ -40,6 +40,7 @@ type InventoryCounts = {
   plants: Map<string, number>;
   decors: Map<string, number>;
   eggs: Map<string, number>;
+  tools: Map<string, number>;
 };
 
 type ClearTask = {
@@ -1272,6 +1273,42 @@ function toChunkedEntries(
   return chunks;
 }
 
+async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: GardenState): Promise<number> {
+  const ignoredDirt = getIgnoredSet(garden, "Dirt");
+  const aliasMap = getPlantAliasMap();
+  
+  let potsNeeded = 0;
+  
+  // Count plants in current garden that will need to be potted
+  for (const [key, draftObj] of Object.entries(garden.tileObjects || {})) {
+    const idx = Number(key);
+    if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+    if (!draftObj || typeof draftObj !== "object") continue;
+    
+    const curObj = (currentGarden.tileObjects || {})[key];
+    if (!curObj || typeof curObj !== "object") continue;
+    const curType = String((curObj as any).objectType || "").toLowerCase();
+    
+    // If current tile has a plant, count it
+    if (curType === "plant") {
+      const draftType = String((draftObj as any).objectType || "").toLowerCase();
+      // If draft wants something different than what's there, need to pot current plant
+      if (draftType === "plant") {
+        const curSpecies = resolvePlantSpeciesKey(String((curObj as any).species || (curObj as any).seedKey || ""), aliasMap);
+        const draftSpecies = resolvePlantSpeciesKey(String((draftObj as any).species || (draftObj as any).seedKey || ""), aliasMap);
+        if (curSpecies !== draftSpecies) {
+          potsNeeded += 1;
+        }
+      } else {
+        // Draft wants decor/empty, need to pot current plant
+        potsNeeded += 1;
+      }
+    }
+  }
+  
+  return potsNeeded;
+}
+
 async function applyGardenServerWithPotting(
   garden: GardenState,
   blocked: number[],
@@ -1280,6 +1317,23 @@ async function applyGardenServerWithPotting(
   const initialGarden = await getCurrentGarden();
   if (!initialGarden) return false;
   let currentGarden: GardenState = initialGarden;
+
+  // Check planter pot requirements
+  const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
+  if (potsNeeded > 0) {
+    const inventory = await getInventoryCounts();
+    const potsOwned = inventory.tools.get("Planter Pot") || 0;
+    if (potsNeeded > potsOwned) {
+      const missing = potsNeeded - potsOwned;
+      await toastSimple(
+        "Garden Layout",
+        `To apply this Layout you need ${potsNeeded} Planter Pots, you're missing ${missing} Planter Pots`,
+        "error",
+        4000
+      );
+      return false;
+    }
+  }
 
   const rawSlots = Number(opts.inventorySlotsAvailable ?? 0);
   const configuredSlots = Number.isFinite(rawSlots) && rawSlots >= 1 ? Math.floor(rawSlots) : 10;
@@ -2380,6 +2434,7 @@ async function getInventoryCounts(): Promise<InventoryCounts> {
     plants: new Map(),
     decors: new Map(),
     eggs: new Map(),
+    tools: new Map(),
   };
 
   try {
@@ -2417,6 +2472,9 @@ async function getInventoryCounts(): Promise<InventoryCounts> {
       } else if (type === "egg") {
         const eggId = String(source.eggId ?? source.data?.eggId ?? "");
         if (eggId) addCount(counts.eggs, eggId, quantity);
+      } else if (type === "tool" || type === "item") {
+        const itemName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
+        if (itemName) addCount(counts.tools, itemName, quantity);
       }
     }
   } catch {}
