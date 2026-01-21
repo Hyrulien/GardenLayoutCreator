@@ -96,7 +96,7 @@ If you don't have enough of something, GLC will place as many items as it can an
   - Import loads a `.json` file back into GLC.
   - Backing up your layouts is recommended.
 - **Invert**: Mirrors the **current tab** (Dirt or Boardwalk) from one side to the other. Each tab inverts separately.
-- **Clear Left / Clear Right**: Toggle options next to **Invert** and **Apply** buttons to clear specific garden sides.
+- **Clear Left / Clear Right**: Automatically clears (pots/picks up) all plants and decor from the left or right side of your garden when you press **Apply Layout**. Useful for preparing a clean side before mirroring a layout, or clearing space for a new design.
 - **Reset Draft**: Clears the entire Layout Creator back to a blank state.
 - **Load from garden**: Copies your current live garden into the editor.
 - **Hide Menu**: Hides the bottom‑right launcher popup.
