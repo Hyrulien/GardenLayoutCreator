@@ -6,13 +6,13 @@ import { attachSpriteIcon } from "../spriteIconCache";
 import { decorCatalog, eggCatalog, mutationCatalog, plantCatalog } from "../../data/hardcoded-data.clean";
 import { fetchRemoteVersion, getLocalVersion } from "../../utils/version";
 import { isDiscordSurface } from "../../utils/api";
+import { DEV_ONLY } from "../../utils/dev";
 import { getKeybind, onKeybindChange, setKeybind } from "../../services/keybinds";
 import { readAriesPath, readGlcPath, writeAriesPath, writeGlcPath } from "../../utils/localStorage";
 import { pageWindow } from "../../utils/page-context";
 
 export function renderEditorMenu(container: HTMLElement) {
   const ui = new Menu({ id: "editor", compact: true });
-  ui.mount(container);
 
   const createActionButton = (label: string) => {
     const button = document.createElement("button");
@@ -76,43 +76,71 @@ export function renderEditorMenu(container: HTMLElement) {
     }
   };
 
-  const view = ui.root.querySelector(".qmm-views") as HTMLElement;
-  view.innerHTML = "";
-  view.style.display = "flex";
-  view.style.flexDirection = "column";
-  view.style.gap = "12px";
-  view.style.justifyContent = "flex-start";
-  view.style.alignItems = "stretch";
-  view.style.height = "100%";
-  view.style.minHeight = "0";
-  view.style.overflow = "hidden";
-  view.style.flex = "1";
-  ui.root.style.display = "flex";
-  ui.root.style.flexDirection = "column";
-  ui.root.style.height = "100%";
-  ui.root.style.maxHeight = "100%";
-  ui.root.style.minHeight = "0";
-  ui.root.style.overflow = "hidden";
-  ui.root.style.flex = "1 1 auto";
-
-  let cleanup: (() => void) | null = null;
-  (view as any).__cleanup__ = () => {
-    try { cleanup?.(); } catch {}
-    cleanup = null;
+  const stripEggs = (garden: any) => {
+    const next = GardenLayoutService.getEmptyGarden();
+    const copyMap = (source: Record<string, any>) => {
+      const out: Record<string, any> = {};
+      for (const [key, obj] of Object.entries(source || {})) {
+        if (!obj || typeof obj !== "object") continue;
+        const type = String((obj as any).objectType ?? (obj as any).type ?? "").toLowerCase();
+        if (type === "egg") continue;
+        out[key] = obj;
+      }
+      return out;
+    };
+    next.tileObjects = copyMap(garden?.tileObjects || {});
+    next.boardwalkTileObjects = copyMap(garden?.boardwalkTileObjects || {});
+    const ignored = garden?.ignoredTiles;
+    if (ignored && typeof ignored === "object") {
+      next.ignoredTiles = {
+        dirt: Array.isArray(ignored.dirt) ? ignored.dirt.filter((n: number) => Number.isFinite(n)) : [],
+        boardwalk: Array.isArray(ignored.boardwalk)
+          ? ignored.boardwalk.filter((n: number) => Number.isFinite(n))
+          : [],
+      };
+    }
+    return next;
   };
 
-  // Layout-only editor UI
-  const sectionCard = (title: string, content: HTMLElement) => {
-    const card = ui.card(title, { tone: "muted", align: "center" });
-    card.root.style.maxWidth = "960px";
-  card.root.style.alignSelf = "stretch";
-  card.body.style.display = "grid";
-    card.body.style.gap = "16px";
-    card.body.style.width = "100%";
-    card.body.style.minHeight = "0";
-    card.body.append(content);
-    return card;
-  };
+  let applyExternalGarden: ((garden: any) => void) | null = null;
+
+  const renderLayoutTab = (view: HTMLElement) => {
+    view.innerHTML = "";
+    view.style.display = "flex";
+    view.style.flexDirection = "column";
+    view.style.gap = "12px";
+    view.style.justifyContent = "flex-start";
+    view.style.alignItems = "stretch";
+    view.style.height = "100%";
+    view.style.minHeight = "0";
+    view.style.overflow = "hidden";
+    view.style.flex = "1";
+    ui.root.style.display = "flex";
+    ui.root.style.flexDirection = "column";
+    ui.root.style.height = "100%";
+    ui.root.style.maxHeight = "100%";
+    ui.root.style.minHeight = "0";
+    ui.root.style.overflow = "hidden";
+    ui.root.style.flex = "1 1 auto";
+
+    let cleanup: (() => void) | null = null;
+    (view as any).__cleanup__ = () => {
+      try { cleanup?.(); } catch {}
+      cleanup = null;
+    };
+
+    // Layout-only editor UI
+    const sectionCard = (title: string, content: HTMLElement) => {
+      const card = ui.card(title, { tone: "muted", align: "center" });
+      card.root.style.maxWidth = "960px";
+      card.root.style.alignSelf = "stretch";
+      card.body.style.display = "grid";
+      card.body.style.gap = "16px";
+      card.body.style.width = "100%";
+      card.body.style.minHeight = "0";
+      card.body.append(content);
+      return card;
+    };
 
   // Layout creator (editor testing)
   const layoutWrap = document.createElement("div");
@@ -1881,32 +1909,6 @@ export function renderEditorMenu(container: HTMLElement) {
     void refreshRequirementInfo();
   };
 
-  const stripEggs = (garden: any) => {
-    const next = GardenLayoutService.getEmptyGarden();
-    const copyMap = (source: Record<string, any>) => {
-      const out: Record<string, any> = {};
-      for (const [key, obj] of Object.entries(source || {})) {
-        if (!obj || typeof obj !== "object") continue;
-        const type = String((obj as any).objectType ?? (obj as any).type ?? "").toLowerCase();
-        if (type === "egg") continue;
-        out[key] = obj;
-      }
-      return out;
-    };
-    next.tileObjects = copyMap(garden?.tileObjects || {});
-    next.boardwalkTileObjects = copyMap(garden?.boardwalkTileObjects || {});
-    const ignored = garden?.ignoredTiles;
-    if (ignored && typeof ignored === "object") {
-      next.ignoredTiles = {
-        dirt: Array.isArray(ignored.dirt) ? ignored.dirt.filter((n: number) => Number.isFinite(n)) : [],
-        boardwalk: Array.isArray(ignored.boardwalk)
-          ? ignored.boardwalk.filter((n: number) => Number.isFinite(n))
-          : [],
-      };
-    }
-    return next;
-  };
-
   const loadFromCurrentGarden = async () => {
     const current = await GardenLayoutService.getCurrentGarden();
     if (current && typeof current === "object") {
@@ -1915,6 +1917,15 @@ export function renderEditorMenu(container: HTMLElement) {
       renderGrid();
       void refreshRequirementInfo();
     } else {
+    }
+  };
+
+  applyExternalGarden = (garden: any) => {
+    if (garden && typeof garden === "object") {
+      draft = stripEggs(garden);
+      syncIgnoredFromDraft();
+      renderGrid();
+      void refreshRequirementInfo();
     }
   };
 
@@ -2404,6 +2415,109 @@ export function renderEditorMenu(container: HTMLElement) {
   void refreshTiles();
 
   // layoutCard already appended
+  };
+
+  const renderDevTab = (view: HTMLElement) => {
+    view.innerHTML = "";
+    view.style.display = "grid";
+    view.style.gap = "12px";
+    view.style.justifyItems = "center";
+    view.style.alignItems = "start";
+    view.style.minHeight = "0";
+
+    const card = ui.card("Dev settings", { tone: "muted", align: "center" });
+    card.root.style.maxWidth = "520px";
+    card.body.style.display = "grid";
+    card.body.style.gap = "10px";
+
+    const statusLine = createStatusLine();
+
+    const selectRow = document.createElement("div");
+    selectRow.style.display = "grid";
+    selectRow.style.gap = "8px";
+
+    const selectLabel = document.createElement("div");
+    selectLabel.textContent = "Select player";
+    selectLabel.style.opacity = "0.85";
+    selectLabel.style.fontSize = "12px";
+
+    const playerSelect = document.createElement("select");
+    playerSelect.style.width = "100%";
+    playerSelect.style.borderRadius = "8px";
+    playerSelect.style.border = "1px solid #2b3441";
+    playerSelect.style.background = "rgba(16,21,28,0.9)";
+    playerSelect.style.color = "#e7eef7";
+    playerSelect.style.padding = "8px 10px";
+    playerSelect.style.fontSize = "14px";
+
+    const refreshBtn = ui.btn("Refresh list", { size: "sm", variant: "ghost" });
+    const loadBtn = ui.btn("Load other player's garden", { size: "sm", variant: "secondary" });
+
+    const buttonRow = document.createElement("div");
+    buttonRow.style.display = "flex";
+    buttonRow.style.flexWrap = "wrap";
+    buttonRow.style.gap = "8px";
+    buttonRow.append(refreshBtn, loadBtn);
+
+    const hydratePlayers = async () => {
+      playerSelect.innerHTML = "";
+      const list = await GardenLayoutService.listLobbyPlayers();
+      if (!list.length) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No other players found";
+        playerSelect.appendChild(opt);
+        playerSelect.disabled = true;
+        return;
+      }
+      playerSelect.disabled = false;
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "Select a player";
+      playerSelect.appendChild(placeholder);
+      for (const p of list) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        const slotLabel = Number.isFinite(p.slotIndex as number) ? ` (#${p.slotIndex})` : "";
+        opt.textContent = `${p.name}${slotLabel}`;
+        playerSelect.appendChild(opt);
+      }
+    };
+
+    refreshBtn.addEventListener("click", () => {
+      void hydratePlayers();
+    });
+
+    loadBtn.addEventListener("click", async () => {
+      const playerId = playerSelect.value;
+      if (!playerId) {
+        showStatus(statusLine, false, "Select a player first.");
+        return;
+      }
+      const garden = await GardenLayoutService.getGardenForPlayerId(playerId);
+      if (!garden) {
+        showStatus(statusLine, false, "Unable to load that player's garden.");
+        return;
+      }
+      if (!applyExternalGarden) {
+        showStatus(statusLine, false, "Open the Layout tab once, then try again.");
+        return;
+      }
+      applyExternalGarden(garden);
+      showStatus(statusLine, true, "Loaded other player's garden into the editor.");
+    });
+
+    selectRow.append(selectLabel, playerSelect);
+    card.body.append(selectRow, buttonRow, statusLine);
+    view.appendChild(card.root);
+    void hydratePlayers();
+  };
+
+  ui.addTab("layout", "Layout", renderLayoutTab);
+  if (DEV_ONLY) {
+    ui.addTab("dev-settings", "Settings", renderDevTab);
+  }
+  ui.mount(container);
 }
 
 function blockGameInput(el: HTMLElement) {

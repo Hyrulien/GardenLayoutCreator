@@ -33,24 +33,9 @@ const parseFrameCategory = (key: string): { category: string; id: string } | nul
 const normalizeSpriteId = (value: string): string =>
   String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-const ALLOWED_SPRITE_CATEGORIES = new Set([
-  'plant',
-  'tallplant',
-  'crop',
-  'decor',
-  'pet',
-  'pets',
-  'pet-egg',
-  'petegg',
-  'mutation',
-  'mutation-overlay',
-].map(normalizeSpriteId));
-
 const isAllowedSpriteKey = (key: string): boolean => {
   const parsed = parseFrameCategory(key);
   if (!parsed) return false;
-  const category = normalizeSpriteId(parsed.category);
-  if (!ALLOWED_SPRITE_CATEGORIES.has(category)) return false;
   return true;
 };
 

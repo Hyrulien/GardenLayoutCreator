@@ -13,6 +13,12 @@ export type SavedLayout = {
   garden: GardenState;
 };
 
+export type LobbyPlayer = {
+  id: string;
+  name: string;
+  slotIndex: number | null;
+};
+
 export type TileEntry = {
   localIdx: number;
   x: number;
@@ -478,6 +484,14 @@ export const GardenLayoutService = {
 
   async getCurrentGarden(): Promise<GardenState | null> {
     return getCurrentGarden();
+  },
+
+  async listLobbyPlayers(): Promise<LobbyPlayer[]> {
+    return await listLobbyPlayers();
+  },
+
+  async getGardenForPlayerId(playerId: string): Promise<GardenState | null> {
+    return await getGardenForPlayer(playerId);
   },
 
   async getInventoryFreeSlots(): Promise<{ usedSlots: number; capacity: number; freeSlots: number } | null> {
@@ -1126,6 +1140,106 @@ async function getPlayerId(): Promise<string | null> {
   const player = await Store.select<any>("playerAtom");
   const pid = (player as any)?.id ?? (player as any)?.playerId ?? null;
   return typeof pid === "string" && pid ? pid : null;
+}
+
+function resolvePlayerLabel(
+  slot: any,
+  fallbackId: string,
+  slotKey?: string,
+  nameMap?: Map<string, string>
+): string {
+  const mapped = nameMap?.get(fallbackId);
+  if (mapped && mapped.trim()) return mapped.trim();
+  const direct =
+    slot?.name ??
+    slot?.playerName ??
+    slot?.displayName ??
+    slot?.username ??
+    slot?.data?.playerName ??
+    slot?.data?.displayName ??
+    slot?.data?.name ??
+    slot?.data?.username ??
+    slot?.data?.player?.name ??
+    slot?.data?.player?.displayName ??
+    slot?.data?.player?.username ??
+    slot?.data?.player?.user?.name ??
+    slot?.data?.player?.user?.displayName ??
+    slot?.data?.player?.user?.username ??
+    slot?.data?.user?.name ??
+    slot?.data?.user?.displayName ??
+    slot?.data?.user?.username;
+  const label = typeof direct === "string" && direct.trim() ? direct.trim() : "";
+  if (label) return label;
+  if (slotKey && slotKey.trim()) return `Player ${slotKey}`;
+  return fallbackId;
+}
+
+function extractPlayerNameMap(state: any): Map<string, string> {
+  const map = new Map<string, string>();
+  const add = (entry: any) => {
+    if (!entry || typeof entry !== "object") return;
+    const idRaw = entry.id ?? entry.playerId ?? entry.userId ?? entry.accountId ?? "";
+    const id = String(idRaw || "").trim();
+    if (!id) return;
+    const nameRaw =
+      entry.name ??
+      entry.displayName ??
+      entry.username ??
+      entry.user?.name ??
+      entry.user?.displayName ??
+      entry.user?.username;
+    const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+    if (name) map.set(id, name);
+  };
+  const candidates = [
+    state?.data?.players,
+    state?.child?.data?.players,
+    state?.child?.data?.playersById,
+    state?.child?.data?.room?.players,
+  ];
+  for (const source of candidates) {
+    if (Array.isArray(source)) {
+      source.forEach(add);
+    } else if (source && typeof source === "object") {
+      Object.values(source).forEach(add);
+    }
+  }
+  return map;
+}
+
+async function listLobbyPlayers(): Promise<LobbyPlayer[]> {
+  try {
+    const cur = await Store.select<any>("stateAtom");
+    const slots = cur?.child?.data?.userSlots;
+    const selfId = await getPlayerId();
+    const players: LobbyPlayer[] = [];
+    const nameMap = extractPlayerNameMap(cur);
+    const pushSlot = (slot: any, slotKey?: string, idx?: number) => {
+      if (!slot || typeof slot !== "object") return;
+      const idRaw = slot?.playerId ?? slot?.id ?? slot?.data?.playerId ?? slot?.data?.id ?? "";
+      const id = String(idRaw || "").trim();
+      if (!id) return;
+      if (selfId && id === selfId) return;
+      const slotIndex =
+        Number.isFinite(idx as number)
+          ? (idx as number)
+          : slotKey && Number.isFinite(Number(slotKey))
+            ? Number(slotKey)
+            : null;
+      const name = resolvePlayerLabel(slot, id, slotKey, nameMap);
+      players.push({ id, name, slotIndex });
+    };
+    if (Array.isArray(slots)) {
+      slots.forEach((slot, idx) => pushSlot(slot, String(idx), idx));
+    } else if (slots && typeof slots === "object") {
+      const entries = Object.entries(slots as Record<string, any>);
+      entries.sort(([a], [b]) => compareSlotKeys(a, b));
+      entries.forEach(([key, slot], idx) => pushSlot(slot, key, idx));
+    }
+    return players;
+  } catch {
+    return [];
+  }
 }
 
 async function getUserSlotIdx(playerId: string): Promise<number | null> {
