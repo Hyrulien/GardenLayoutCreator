@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLC - Garden Layout Creator
 // @namespace    GLC
-// @version      v1.0.1
+// @version      v1.0.2
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -6197,6 +6197,7 @@
   };
 
   // src/services/gardenLayout.ts
+  var lastInventoryDebug = null;
   var ARIES_LAYOUTS_PATH = "editor.savedGardens";
   var LEGACY_LAYOUTS_PATH = "editor.savedLayouts";
   var LEGACY_LAYOUTS_KEY = "qws:editor:saved-layouts";
@@ -6367,6 +6368,51 @@
         return a.id.localeCompare(b.id);
       });
       return summary;
+    },
+    async getPlanterPotRequirement(garden, currentGarden) {
+      const needed = await calculatePlanterPotsNeeded(garden, currentGarden);
+      const inventory = await getInventoryCounts();
+      const owned = inventory.tools.get("Planter Pot") || inventory.tools.get("PlanterPot") || 0;
+      return { needed, owned };
+    },
+    getBlockedTargetTiles(currentGarden, targetGarden) {
+      return getBlockedTargetTilesFromState(currentGarden, targetGarden);
+    },
+    getDraftRemovalTiles(garden, currentGarden) {
+      const removal = {
+        Dirt: /* @__PURE__ */ new Set(),
+        Boardwalk: /* @__PURE__ */ new Set()
+      };
+      const add = (tileType, idx) => {
+        if (Number.isFinite(idx)) removal[tileType].add(idx);
+      };
+      const checkMap = (tileType, currentMap, draftMap) => {
+        const ignored = getIgnoredSet(garden, tileType);
+        for (const [key, curObj] of Object.entries(currentMap || {})) {
+          const idx = Number(key);
+          if (Number.isFinite(idx) && ignored.has(idx)) continue;
+          if (!curObj || typeof curObj !== "object") continue;
+          const draftObj = draftMap?.[key];
+          if (!draftObj || typeof draftObj !== "object") {
+            add(tileType, idx);
+            continue;
+          }
+          if (!isSameTileObject(curObj, draftObj)) {
+            add(tileType, idx);
+            continue;
+          }
+          const curType = String(curObj.objectType ?? curObj.type ?? "").toLowerCase();
+          if (curType === "plant") {
+            const desiredMutation = getDesiredMutation(draftObj);
+            if (desiredMutation && !plantHasMutation(curObj, desiredMutation)) {
+              add(tileType, idx);
+            }
+          }
+        }
+      };
+      checkMap("Dirt", currentGarden.tileObjects || {}, garden.tileObjects || {});
+      checkMap("Boardwalk", currentGarden.boardwalkTileObjects || {}, garden.boardwalkTileObjects || {});
+      return removal;
     },
     resolvePlantSpecies(raw) {
       const aliasMap = getPlantAliasMap();
@@ -7200,28 +7246,97 @@
   async function calculatePlanterPotsNeeded(garden, currentGarden) {
     const ignoredDirt = getIgnoredSet(garden, "Dirt");
     const aliasMap = getPlantAliasMap();
-    let potsNeeded = 0;
+    const desiredBySpecies = /* @__PURE__ */ new Map();
+    const desiredByMutation = /* @__PURE__ */ new Map();
+    const inPlaceBySpecies = /* @__PURE__ */ new Map();
+    const inPlaceByMutation = /* @__PURE__ */ new Map();
+    const potSupplyBySpecies = /* @__PURE__ */ new Map();
+    const potSupplyByMutation = /* @__PURE__ */ new Map();
+    let potsFromTargets = 0;
+    const addMap = (map, key, qty) => {
+      if (!key) return;
+      map.set(key, (map.get(key) || 0) + qty);
+    };
     for (const [key, draftObj] of Object.entries(garden.tileObjects || {})) {
       const idx = Number(key);
       if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
       if (!draftObj || typeof draftObj !== "object") continue;
+      const desiredType = String(draftObj.objectType || "").toLowerCase();
+      const desiredMutation = desiredType === "plant" ? getDesiredMutation(draftObj) : null;
+      const desiredSpecies = desiredType === "plant" ? resolvePlantSpeciesKey(String(draftObj.species || draftObj.seedKey || ""), aliasMap) : "";
+      if (desiredType === "plant" && desiredSpecies) {
+        if (desiredMutation) {
+          addMap(desiredByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+        } else {
+          addMap(desiredBySpecies, desiredSpecies, 1);
+        }
+      }
       const curObj = (currentGarden.tileObjects || {})[key];
       if (!curObj || typeof curObj !== "object") continue;
       const curType = String(curObj.objectType || "").toLowerCase();
-      if (curType === "plant") {
-        const draftType = String(draftObj.objectType || "").toLowerCase();
-        if (draftType === "plant") {
-          const curSpecies = resolvePlantSpeciesKey(String(curObj.species || curObj.seedKey || ""), aliasMap);
-          const draftSpecies = resolvePlantSpeciesKey(String(draftObj.species || draftObj.seedKey || ""), aliasMap);
-          if (curSpecies !== draftSpecies) {
-            potsNeeded += 1;
+      if (curType !== "plant") continue;
+      const curSpecies = resolvePlantSpeciesKey(String(curObj.species || curObj.seedKey || ""), aliasMap);
+      const curMutations = getPlantMutations(curObj);
+      const curHasDesiredMutation = desiredMutation ? curMutations.includes(desiredMutation) : false;
+      let inPlace = false;
+      if (desiredType === "plant" && desiredSpecies && curSpecies === desiredSpecies) {
+        if (!desiredMutation || curHasDesiredMutation) {
+          inPlace = true;
+          if (desiredMutation) {
+            addMap(inPlaceByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+          } else {
+            addMap(inPlaceBySpecies, desiredSpecies, 1);
           }
-        } else {
-          potsNeeded += 1;
+        }
+      }
+      if (!inPlace) {
+        potsFromTargets += 1;
+        if (curSpecies) addMap(potSupplyBySpecies, curSpecies, 1);
+        for (const mut of curMutations) {
+          addMap(potSupplyByMutation, mutationKeyFor(curSpecies, mut), 1);
         }
       }
     }
-    return potsNeeded;
+    const invPlants = await readPlantInventoryBySpecies(aliasMap);
+    const invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+    const invBySpecies = /* @__PURE__ */ new Map();
+    for (const [species, ids] of invPlants.entries()) {
+      addMap(invBySpecies, species, ids.length);
+    }
+    const invByMutation = /* @__PURE__ */ new Map();
+    for (const [species, entries] of invPlantsByMutation.entries()) {
+      for (const entry of entries) {
+        for (const mut of entry.mutations) {
+          addMap(invByMutation, mutationKeyFor(species, mut), 1);
+        }
+      }
+    }
+    const gardenBySpecies = countGardenPlants(currentGarden, aliasMap, ignoredDirt);
+    const gardenByMutation = countGardenPlantsByMutation(currentGarden, aliasMap, ignoredDirt);
+    let potsFromGarden = 0;
+    for (const [species, desiredCount] of desiredBySpecies.entries()) {
+      const inPlace = inPlaceBySpecies.get(species) || 0;
+      const required = Math.max(0, desiredCount - inPlace);
+      const availableInv = (invBySpecies.get(species) || 0) + (potSupplyBySpecies.get(species) || 0);
+      const missing = Math.max(0, required - availableInv);
+      const availableGarden = Math.max(
+        0,
+        (gardenBySpecies.get(species) || 0) - inPlace - (potSupplyBySpecies.get(species) || 0)
+      );
+      potsFromGarden += Math.min(missing, availableGarden);
+    }
+    for (const [key, desiredCount] of desiredByMutation.entries()) {
+      const inPlace = inPlaceByMutation.get(key) || 0;
+      const required = Math.max(0, desiredCount - inPlace);
+      const availableInv = (invByMutation.get(key) || 0) + (potSupplyByMutation.get(key) || 0);
+      const missing = Math.max(0, required - availableInv);
+      const availableGarden = Math.max(
+        0,
+        (gardenByMutation.get(key) || 0) - inPlace - (potSupplyByMutation.get(key) || 0)
+      );
+      potsFromGarden += Math.min(missing, availableGarden);
+    }
+    return potsFromTargets + potsFromGarden;
   }
   async function applyGardenServerWithPotting(garden, blocked, opts) {
     const initialGarden = await getCurrentGarden();
@@ -7230,7 +7345,18 @@
     const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
     if (potsNeeded > 0) {
       const inventory = await getInventoryCounts();
-      const potsOwned = inventory.tools.get("Planter Pot") || 0;
+      const potsOwned = inventory.tools.get("Planter Pot") || inventory.tools.get("PlanterPot") || 0;
+      try {
+        console.info("[GLC][PlanterPot] inventory check", {
+          potsNeeded,
+          potsOwned,
+          toolEntries: lastInventoryDebug?.toolEntries ?? [],
+          potLikeEntries: lastInventoryDebug?.potLikeEntries ?? [],
+          typeCounts: lastInventoryDebug?.typeCounts ?? {},
+          itemsCount: lastInventoryDebug?.itemsCount ?? 0
+        });
+      } catch {
+      }
       if (potsNeeded > potsOwned) {
         const missing = potsNeeded - potsOwned;
         await toastSimple(
@@ -8112,16 +8238,24 @@
       eggs: /* @__PURE__ */ new Map(),
       tools: /* @__PURE__ */ new Map()
     };
+    const toolEntries = [];
+    const potLikeEntries = [];
+    const typeCounts = /* @__PURE__ */ new Map();
+    const toolRawItems = [];
+    let itemsCount = 0;
     try {
       const inventory = await Store.select("myInventoryAtom");
       const items = extractInventoryItems(inventory);
+      itemsCount = items.length;
       const aliasMap = getPlantAliasMap();
       for (const entry of items) {
         if (!entry || typeof entry !== "object") continue;
         const source = entry.item && typeof entry.item === "object" ? entry.item : entry;
         if (!source || typeof source !== "object") continue;
-        const type = String(source.itemType ?? source.data?.itemType ?? "").toLowerCase();
+        const typeRaw = String(source.itemType ?? source.data?.itemType ?? "");
+        const type = typeRaw.toLowerCase();
         const quantity = Number(source.quantity ?? source.count ?? 1);
+        typeCounts.set(typeRaw || "(empty)", (typeCounts.get(typeRaw || "(empty)") || 0) + 1);
         if (type === "seed") {
           const rawSpecies = String(source.species ?? source.seedSpecies ?? source.data?.species ?? "");
           const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
@@ -8139,10 +8273,83 @@
           const eggId = String(source.eggId ?? source.data?.eggId ?? "");
           if (eggId) addCount(counts.eggs, eggId, quantity);
         } else if (type === "tool" || type === "item") {
-          const itemName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
-          if (itemName) addCount(counts.tools, itemName, quantity);
+          const itemName = String(
+            source.name ?? source.itemName ?? source.toolId ?? source.itemId ?? source.data?.name ?? source.data?.toolId ?? source.data?.itemId ?? ""
+          );
+          if (toolRawItems.length < 50) {
+            toolRawItems.push({
+              id: source.id,
+              toolId: source.toolId,
+              itemId: source.itemId,
+              name: source.name,
+              itemName: source.itemName,
+              itemType: source.itemType ?? source.data?.itemType,
+              dataName: source.data?.name,
+              dataId: source.data?.id,
+              dataToolId: source.data?.toolId,
+              dataItemId: source.data?.itemId,
+              rawKeys: Object.keys(source || {}),
+              dataKeys: source.data && typeof source.data === "object" ? Object.keys(source.data) : []
+            });
+          }
+          if (itemName) {
+            addCount(counts.tools, itemName, quantity);
+            if (toolEntries.length < 50) {
+              toolEntries.push({
+                name: itemName,
+                quantity,
+                itemType: String(source.itemType ?? source.data?.itemType ?? ""),
+                raw: {
+                  id: source.id,
+                  toolId: source.toolId,
+                  itemId: source.itemId,
+                  name: source.name,
+                  itemName: source.itemName,
+                  itemType: source.itemType,
+                  dataName: source.data?.name,
+                  dataId: source.data?.id,
+                  dataToolId: source.data?.toolId,
+                  dataItemId: source.data?.itemId
+                }
+              });
+            }
+          }
+        } else {
+          const candidateName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
+          if (candidateName && /pot/i.test(candidateName)) {
+            if (potLikeEntries.length < 50) {
+              potLikeEntries.push({
+                name: candidateName,
+                quantity,
+                itemType: typeRaw,
+                raw: {
+                  id: source.id,
+                  toolId: source.toolId,
+                  itemId: source.itemId,
+                  name: source.name,
+                  itemName: source.itemName,
+                  itemType: source.itemType,
+                  dataName: source.data?.name,
+                  dataId: source.data?.id,
+                  dataToolId: source.data?.toolId,
+                  dataItemId: source.data?.itemId
+                }
+              });
+            }
+          }
         }
       }
+    } catch {
+    }
+    lastInventoryDebug = {
+      itemsCount,
+      toolEntries,
+      potLikeEntries,
+      typeCounts: Object.fromEntries(typeCounts),
+      toolRawItems
+    };
+    try {
+      window.__GLC_LastInventoryDebug = lastInventoryDebug;
     } catch {
     }
     return counts;
@@ -8309,7 +8516,10 @@
     "tallplant",
     "crop",
     "decor",
+    "item",
     "pet",
+    "seed",
+    "ui",
     "mutation",
     "mutation-overlay"
   ];
@@ -9808,9 +10018,17 @@
     let currentKind = "Dirt";
     let lastDirtType = "plant";
     let selectedTile = null;
+    let selectedTiles = /* @__PURE__ */ new Set();
+    let selectionAnchor = null;
+    let selectionActive = false;
+    let groupDragActive = false;
+    let groupDragAnchor = null;
+    let lastGroupDelta = { dx: 0, dy: 0 };
     let draft = GardenLayoutService.getEmptyGarden();
     let currentGarden = GardenLayoutService.getEmptyGarden();
     let currentTiles = [];
+    let tilePosByIdx = /* @__PURE__ */ new Map();
+    let tileIdxByPos = /* @__PURE__ */ new Map();
     const tileCells = /* @__PURE__ */ new Map();
     let missingPlantTiles = /* @__PURE__ */ new Set();
     let missingDecorTiles = /* @__PURE__ */ new Set();
@@ -9845,7 +10063,79 @@
     };
     const isIgnoredTile = (idx) => ignoredTilesByType[currentKind].has(idx);
     const isEggTile = (idx) => liveEggTiles[currentKind].has(idx);
+    const getTilePos = (idx) => tilePosByIdx.get(idx) || null;
+    const getTileIdxAt = (x, y) => tileIdxByPos.get(`${x},${y}`) ?? null;
     syncIgnoredFromDraft();
+    const applySelectedTiles = (next) => {
+      const prev = selectedTiles;
+      selectedTiles = next;
+      for (const idx of prev) {
+        if (!next.has(idx)) updateTileCell(idx);
+      }
+      for (const idx of next) {
+        if (!prev.has(idx)) updateTileCell(idx);
+      }
+      updateSelectionLabel();
+    };
+    const clearSelectedTiles = () => {
+      if (!selectedTiles.size) return;
+      const prev = selectedTiles;
+      selectedTiles = /* @__PURE__ */ new Set();
+      for (const idx of prev) {
+        updateTileCell(idx);
+      }
+      updateSelectionLabel();
+    };
+    const selectTilesInRect = (start2, end) => {
+      const minX = Math.min(start2.x, end.x);
+      const maxX = Math.max(start2.x, end.x);
+      const minY = Math.min(start2.y, end.y);
+      const maxY = Math.max(start2.y, end.y);
+      const next = /* @__PURE__ */ new Set();
+      for (const tile of currentTiles) {
+        if (tile.x < minX || tile.x > maxX || tile.y < minY || tile.y > maxY) continue;
+        next.add(tile.localIdx);
+      }
+      applySelectedTiles(next);
+    };
+    const moveSelectedTilesBy = (dx, dy) => {
+      if (!dx && !dy) return true;
+      if (!selectedTiles.size) return false;
+      const targetIndices = [];
+      for (const idx of selectedTiles) {
+        const pos = getTilePos(idx);
+        if (!pos) return false;
+        const targetIdx = getTileIdxAt(pos.x + dx, pos.y + dy);
+        if (targetIdx == null) return false;
+        if (isIgnoredTile(targetIdx) || isEggTile(targetIdx)) return false;
+        targetIndices.push(targetIdx);
+      }
+      const map = currentKind === "Dirt" ? draft.tileObjects : draft.boardwalkTileObjects;
+      const moved = /* @__PURE__ */ new Map();
+      for (const idx of selectedTiles) {
+        const obj = map[String(idx)];
+        if (obj && typeof obj === "object") {
+          const pos = getTilePos(idx);
+          if (!pos) continue;
+          const targetIdx = getTileIdxAt(pos.x + dx, pos.y + dy);
+          if (targetIdx == null) continue;
+          moved.set(targetIdx, obj);
+        }
+      }
+      for (const idx of selectedTiles) {
+        delete map[String(idx)];
+      }
+      for (const [targetIdx, obj] of moved.entries()) {
+        map[String(targetIdx)] = obj;
+      }
+      const nextSelected = new Set(targetIndices);
+      applySelectedTiles(nextSelected);
+      for (const idx of targetIndices) {
+        updateTileCell(idx);
+      }
+      void refreshRequirementInfo();
+      return true;
+    };
     const updateClearMarkers = async () => {
       if (!clearLeftToggle.checked && !clearRightToggle.checked) {
         clearMarkedTiles.Dirt.clear();
@@ -9860,13 +10150,16 @@
           clearLeft: clearLeftToggle.checked,
           clearRight: clearRightToggle.checked
         });
+        const blockedTargets = new Set(
+          GardenLayoutService.getBlockedTargetTiles(currentGarden, draft)
+        );
         const dirtSet = /* @__PURE__ */ new Set();
         const boardSet = /* @__PURE__ */ new Set();
         for (const task of tasks) {
           if (task.tileType === "Dirt") {
-            dirtSet.add(task.localIdx);
+            if (!blockedTargets.has(task.localIdx)) dirtSet.add(task.localIdx);
           } else {
-            boardSet.add(task.localIdx);
+            if (!blockedTargets.has(task.localIdx)) boardSet.add(task.localIdx);
           }
         }
         clearMarkedTiles.Dirt = dirtSet;
@@ -9881,7 +10174,8 @@
       layoutStatus.textContent = msg;
     };
     const updateSelectionLabel = () => {
-      selectionCount.textContent = `${selectedTile == null ? 0 : 1} tiles selected`;
+      const count = selectedTiles.size ? selectedTiles.size : selectedTile == null ? 0 : 1;
+      selectionCount.textContent = `${count} tiles selected`;
     };
     const hasDraftTiles = () => Object.keys(draft.tileObjects || {}).length > 0 || Object.keys(draft.boardwalkTileObjects || {}).length > 0;
     const saveNewLayout = () => {
@@ -9901,6 +10195,7 @@
         GardenLayoutService.getCurrentGarden()
       ]);
       currentGarden = liveGarden || GardenLayoutService.getEmptyGarden();
+      const potRequirement = await GardenLayoutService.getPlanterPotRequirement(draft, currentGarden);
       const nextEggs = {
         Dirt: /* @__PURE__ */ new Set(),
         Boardwalk: /* @__PURE__ */ new Set()
@@ -9990,12 +10285,29 @@
       }
       blockedTiles = nextBlocked;
       requirementsWrap.replaceChildren();
-      if (!list.length) {
+      const hasPotRequirement = potRequirement.needed > 0;
+      if (!list.length && !hasPotRequirement) {
         const empty = document.createElement("div");
         empty.textContent = "No requirements";
         empty.style.opacity = "0.7";
         requirementsWrap.appendChild(empty);
       } else {
+        if (hasPotRequirement) {
+          const row = document.createElement("div");
+          row.style.display = "flex";
+          row.style.alignItems = "center";
+          row.style.gap = "6px";
+          row.style.whiteSpace = "nowrap";
+          row.style.color = potRequirement.owned >= potRequirement.needed ? "#58d38a" : "#ff6b6b";
+          const icon = document.createElement("div");
+          icon.style.width = "16px";
+          icon.style.height = "16px";
+          attachSpriteIcon(icon, ["item", "tool", "decor"], ["PlanterPot", "Planter Pot"], 14, "editor-req-tool");
+          const label = document.createElement("div");
+          label.textContent = `Planter Pots ${potRequirement.owned}/${potRequirement.needed}`;
+          row.append(icon, label);
+          requirementsWrap.appendChild(row);
+        }
         for (const item of list) {
           const row = document.createElement("div");
           row.style.display = "flex";
@@ -10127,12 +10439,16 @@
       let maxX = -Infinity;
       let maxY = -Infinity;
       const byPos = /* @__PURE__ */ new Map();
+      tilePosByIdx = /* @__PURE__ */ new Map();
+      tileIdxByPos = /* @__PURE__ */ new Map();
       for (const t of currentTiles) {
         minX = Math.min(minX, t.x);
         minY = Math.min(minY, t.y);
         maxX = Math.max(maxX, t.x);
         maxY = Math.max(maxY, t.y);
         byPos.set(`${t.x},${t.y}`, t);
+        tilePosByIdx.set(t.localIdx, { x: t.x, y: t.y });
+        tileIdxByPos.set(`${t.x},${t.y}`, t.localIdx);
       }
       const cols = maxX - minX + 1;
       const rows = maxY - minY + 1;
@@ -10235,6 +10551,9 @@
             void refreshRequirementInfo();
           };
           const applySelectionToTile = () => {
+            if (selectedTiles.size) {
+              clearSelectedTiles();
+            }
             const prev = selectedTile;
             selectedTile = tile.localIdx;
             applySelectedItemToTile();
@@ -10295,12 +10614,42 @@
               return;
             }
             if (btn !== 0) return;
+            if (event.altKey) {
+              const pos = getTilePos(tile.localIdx);
+              if (!pos) return;
+              selectionActive = true;
+              selectionAnchor = pos;
+              groupDragActive = false;
+              lastGroupDelta = { dx: 0, dy: 0 };
+              if (selectedTile != null) {
+                const prev = selectedTile;
+                selectedTile = null;
+                updateTileCell(prev);
+              }
+              selectTilesInRect(pos, pos);
+              return;
+            }
             isDragging = true;
             clearDragActive = false;
             if (event.shiftKey) {
               const removing = isIgnoredTile(tile.localIdx);
               dragMode = removing ? "ignore-remove" : "ignore-add";
               applyIgnoreToTile(removing);
+              return;
+            }
+            if (selectedTiles.size > 1 && selectedTiles.has(tile.localIdx)) {
+              const pos = getTilePos(tile.localIdx);
+              if (!pos) return;
+              groupDragActive = true;
+              groupDragAnchor = pos;
+              lastGroupDelta = { dx: 0, dy: 0 };
+              isDragging = false;
+              if (selectedTile != null) {
+                const prev = selectedTile;
+                selectedTile = null;
+                updateSelectionLabel();
+                updateTileCell(prev);
+              }
               return;
             }
             dragMode = "apply";
@@ -10332,10 +10681,31 @@
       }
     };
     tilesWrap.addEventListener("mousemove", (event) => {
-      if (!isDragging || dragMode !== "clear" || !clearDragActive) return;
       const el2 = document.elementFromPoint(event.clientX, event.clientY);
       const btn = el2?.closest?.("button[data-local-idx]");
       const idx = btn ? Number(btn.dataset.localIdx) : NaN;
+      if (selectionActive && selectionAnchor) {
+        if (!Number.isFinite(idx)) return;
+        const pos = getTilePos(idx);
+        if (!pos) return;
+        selectTilesInRect(selectionAnchor, pos);
+        return;
+      }
+      if (groupDragActive && groupDragAnchor) {
+        if (!Number.isFinite(idx)) return;
+        const pos = getTilePos(idx);
+        if (!pos) return;
+        const nextDx = pos.x - groupDragAnchor.x;
+        const nextDy = pos.y - groupDragAnchor.y;
+        if (nextDx === lastGroupDelta.dx && nextDy === lastGroupDelta.dy) return;
+        const diffDx = nextDx - lastGroupDelta.dx;
+        const diffDy = nextDy - lastGroupDelta.dy;
+        if (moveSelectedTilesBy(diffDx, diffDy)) {
+          lastGroupDelta = { dx: nextDx, dy: nextDy };
+        }
+        return;
+      }
+      if (!isDragging || dragMode !== "clear" || !clearDragActive) return;
       if (Number.isFinite(idx)) {
         clearTileByIdx(idx);
       }
@@ -10398,6 +10768,7 @@
       const occupied = !!obj;
       const mutation = obj && typeof obj === "object" && typeof obj.glcMutation === "string" ? GardenLayoutService.normalizeMutation(String(obj.glcMutation)) : "";
       const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
+      const isSelected = selectedTile === idx || selectedTiles.has(idx);
       cell.style.borderImage = "none";
       cell.style.borderImageSlice = "";
       if (isIgnoredTile(idx)) {
@@ -10406,7 +10777,7 @@
       } else if (isEggTile(idx)) {
         cell.style.borderColor = "#f5c542";
         cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-      } else if (selectedTile === idx) {
+      } else if (isSelected) {
         cell.style.borderColor = "#3cd17a";
         cell.style.boxShadow = "0 0 0 2px rgba(60,209,122,0.7) inset";
       } else if (blockedTiles.has(idx)) {
@@ -10733,18 +11104,25 @@
     tabDirt.addEventListener("click", () => {
       setActiveTab("Dirt");
       selectedTile = null;
+      clearSelectedTiles();
       updateSelectionLabel();
       refreshTiles();
     });
     tabBoard.addEventListener("click", () => {
       setActiveTab("Boardwalk");
       selectedTile = null;
+      clearSelectedTiles();
       updateSelectionLabel();
       refreshTiles();
     });
     const onMouseUp = () => {
       isDragging = false;
       clearDragActive = false;
+      selectionActive = false;
+      selectionAnchor = null;
+      groupDragActive = false;
+      groupDragAnchor = null;
+      lastGroupDelta = { dx: 0, dy: 0 };
     };
     document.addEventListener("mouseup", onMouseUp);
     cleanup = () => {

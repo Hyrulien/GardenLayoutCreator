@@ -1019,9 +1019,17 @@ export function renderEditorMenu(container: HTMLElement) {
   let currentKind: "Dirt" | "Boardwalk" = "Dirt";
   let lastDirtType: "plant" | "decor" | "mutation" = "plant";
   let selectedTile: number | null = null;
+  let selectedTiles = new Set<number>();
+  let selectionAnchor: { x: number; y: number } | null = null;
+  let selectionActive = false;
+  let groupDragActive = false;
+  let groupDragAnchor: { x: number; y: number } | null = null;
+  let lastGroupDelta = { dx: 0, dy: 0 };
   let draft = GardenLayoutService.getEmptyGarden();
   let currentGarden = GardenLayoutService.getEmptyGarden();
   let currentTiles: Array<{ localIdx: number; x: number; y: number }> = [];
+  let tilePosByIdx = new Map<number, { x: number; y: number }>();
+  let tileIdxByPos = new Map<string, number>();
   const tileCells = new Map<number, HTMLButtonElement>();
   let missingPlantTiles = new Set<number>();
   let missingDecorTiles = new Set<string>();
@@ -1056,7 +1064,83 @@ export function renderEditorMenu(container: HTMLElement) {
   };
   const isIgnoredTile = (idx: number) => ignoredTilesByType[currentKind].has(idx);
   const isEggTile = (idx: number) => liveEggTiles[currentKind].has(idx);
+  const getTilePos = (idx: number): { x: number; y: number } | null => tilePosByIdx.get(idx) || null;
+  const getTileIdxAt = (x: number, y: number): number | null => tileIdxByPos.get(`${x},${y}`) ?? null;
   syncIgnoredFromDraft();
+
+  const applySelectedTiles = (next: Set<number>) => {
+    const prev = selectedTiles;
+    selectedTiles = next;
+    for (const idx of prev) {
+      if (!next.has(idx)) updateTileCell(idx);
+    }
+    for (const idx of next) {
+      if (!prev.has(idx)) updateTileCell(idx);
+    }
+    updateSelectionLabel();
+  };
+
+  const clearSelectedTiles = () => {
+    if (!selectedTiles.size) return;
+    const prev = selectedTiles;
+    selectedTiles = new Set<number>();
+    for (const idx of prev) {
+      updateTileCell(idx);
+    }
+    updateSelectionLabel();
+  };
+
+  const selectTilesInRect = (start: { x: number; y: number }, end: { x: number; y: number }) => {
+    const minX = Math.min(start.x, end.x);
+    const maxX = Math.max(start.x, end.x);
+    const minY = Math.min(start.y, end.y);
+    const maxY = Math.max(start.y, end.y);
+    const next = new Set<number>();
+    for (const tile of currentTiles) {
+      if (tile.x < minX || tile.x > maxX || tile.y < minY || tile.y > maxY) continue;
+      next.add(tile.localIdx);
+    }
+    applySelectedTiles(next);
+  };
+
+  const moveSelectedTilesBy = (dx: number, dy: number): boolean => {
+    if (!dx && !dy) return true;
+    if (!selectedTiles.size) return false;
+    const targetIndices: number[] = [];
+    for (const idx of selectedTiles) {
+      const pos = getTilePos(idx);
+      if (!pos) return false;
+      const targetIdx = getTileIdxAt(pos.x + dx, pos.y + dy);
+      if (targetIdx == null) return false;
+      if (isIgnoredTile(targetIdx) || isEggTile(targetIdx)) return false;
+      targetIndices.push(targetIdx);
+    }
+    const map = currentKind === "Dirt" ? draft.tileObjects : draft.boardwalkTileObjects;
+    const moved = new Map<number, any>();
+    for (const idx of selectedTiles) {
+      const obj = map[String(idx)];
+      if (obj && typeof obj === "object") {
+        const pos = getTilePos(idx);
+        if (!pos) continue;
+        const targetIdx = getTileIdxAt(pos.x + dx, pos.y + dy);
+        if (targetIdx == null) continue;
+        moved.set(targetIdx, obj);
+      }
+    }
+    for (const idx of selectedTiles) {
+      delete map[String(idx)];
+    }
+    for (const [targetIdx, obj] of moved.entries()) {
+      map[String(targetIdx)] = obj;
+    }
+    const nextSelected = new Set<number>(targetIndices);
+    applySelectedTiles(nextSelected);
+    for (const idx of targetIndices) {
+      updateTileCell(idx);
+    }
+    void refreshRequirementInfo();
+    return true;
+  };
 
   const updateClearMarkers = async () => {
     if (!clearLeftToggle.checked && !clearRightToggle.checked) {
@@ -1072,13 +1156,16 @@ export function renderEditorMenu(container: HTMLElement) {
         clearLeft: clearLeftToggle.checked,
         clearRight: clearRightToggle.checked,
       });
+      const blockedTargets = new Set<number>(
+        GardenLayoutService.getBlockedTargetTiles(currentGarden, draft)
+      );
       const dirtSet = new Set<number>();
       const boardSet = new Set<number>();
       for (const task of tasks) {
         if (task.tileType === "Dirt") {
-          dirtSet.add(task.localIdx);
+          if (!blockedTargets.has(task.localIdx)) dirtSet.add(task.localIdx);
         } else {
-          boardSet.add(task.localIdx);
+          if (!blockedTargets.has(task.localIdx)) boardSet.add(task.localIdx);
         }
       }
       clearMarkedTiles.Dirt = dirtSet;
@@ -1096,7 +1183,8 @@ export function renderEditorMenu(container: HTMLElement) {
   };
 
   const updateSelectionLabel = () => {
-    selectionCount.textContent = `${selectedTile == null ? 0 : 1} tiles selected`;
+    const count = selectedTiles.size ? selectedTiles.size : selectedTile == null ? 0 : 1;
+    selectionCount.textContent = `${count} tiles selected`;
   };
 
   const hasDraftTiles = () =>
@@ -1120,6 +1208,7 @@ export function renderEditorMenu(container: HTMLElement) {
       GardenLayoutService.getCurrentGarden(),
     ]);
     currentGarden = liveGarden || GardenLayoutService.getEmptyGarden();
+    const potRequirement = await GardenLayoutService.getPlanterPotRequirement(draft, currentGarden);
     const nextEggs: Record<"Dirt" | "Boardwalk", Set<number>> = {
       Dirt: new Set(),
       Boardwalk: new Set(),
@@ -1218,12 +1307,29 @@ export function renderEditorMenu(container: HTMLElement) {
     }
     blockedTiles = nextBlocked;
     requirementsWrap.replaceChildren();
-    if (!list.length) {
+    const hasPotRequirement = potRequirement.needed > 0;
+    if (!list.length && !hasPotRequirement) {
       const empty = document.createElement("div");
       empty.textContent = "No requirements";
       empty.style.opacity = "0.7";
       requirementsWrap.appendChild(empty);
     } else {
+      if (hasPotRequirement) {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "6px";
+        row.style.whiteSpace = "nowrap";
+        row.style.color = potRequirement.owned >= potRequirement.needed ? "#58d38a" : "#ff6b6b";
+        const icon = document.createElement("div");
+        icon.style.width = "16px";
+        icon.style.height = "16px";
+        attachSpriteIcon(icon, ["item", "tool", "decor"], ["PlanterPot", "Planter Pot"], 14, "editor-req-tool");
+        const label = document.createElement("div");
+        label.textContent = `Planter Pots ${potRequirement.owned}/${potRequirement.needed}`;
+        row.append(icon, label);
+        requirementsWrap.appendChild(row);
+      }
       for (const item of list) {
         const row = document.createElement("div");
         row.style.display = "flex";
@@ -1364,12 +1470,16 @@ export function renderEditorMenu(container: HTMLElement) {
     let maxX = -Infinity;
     let maxY = -Infinity;
     const byPos = new Map<string, { localIdx: number; x: number; y: number }>();
+    tilePosByIdx = new Map<number, { x: number; y: number }>();
+    tileIdxByPos = new Map<string, number>();
     for (const t of currentTiles) {
       minX = Math.min(minX, t.x);
       minY = Math.min(minY, t.y);
       maxX = Math.max(maxX, t.x);
       maxY = Math.max(maxY, t.y);
       byPos.set(`${t.x},${t.y}`, t);
+      tilePosByIdx.set(t.localIdx, { x: t.x, y: t.y });
+      tileIdxByPos.set(`${t.x},${t.y}`, t.localIdx);
     }
 
     const cols = maxX - minX + 1;
@@ -1485,6 +1595,9 @@ export function renderEditorMenu(container: HTMLElement) {
         };
 
         const applySelectionToTile = () => {
+          if (selectedTiles.size) {
+            clearSelectedTiles();
+          }
           const prev = selectedTile;
           selectedTile = tile.localIdx;
           applySelectedItemToTile();
@@ -1547,12 +1660,42 @@ export function renderEditorMenu(container: HTMLElement) {
             return;
           }
           if (btn !== 0) return;
+          if ((event as MouseEvent).altKey) {
+            const pos = getTilePos(tile.localIdx);
+            if (!pos) return;
+            selectionActive = true;
+            selectionAnchor = pos;
+            groupDragActive = false;
+            lastGroupDelta = { dx: 0, dy: 0 };
+            if (selectedTile != null) {
+              const prev = selectedTile;
+              selectedTile = null;
+              updateTileCell(prev);
+            }
+            selectTilesInRect(pos, pos);
+            return;
+          }
           isDragging = true;
           clearDragActive = false;
           if ((event as MouseEvent).shiftKey) {
             const removing = isIgnoredTile(tile.localIdx);
             dragMode = removing ? "ignore-remove" : "ignore-add";
             applyIgnoreToTile(removing);
+            return;
+          }
+          if (selectedTiles.size > 1 && selectedTiles.has(tile.localIdx)) {
+            const pos = getTilePos(tile.localIdx);
+            if (!pos) return;
+            groupDragActive = true;
+            groupDragAnchor = pos;
+            lastGroupDelta = { dx: 0, dy: 0 };
+            isDragging = false;
+            if (selectedTile != null) {
+              const prev = selectedTile;
+              selectedTile = null;
+              updateSelectionLabel();
+              updateTileCell(prev);
+            }
             return;
           }
           dragMode = "apply";
@@ -1585,10 +1728,31 @@ export function renderEditorMenu(container: HTMLElement) {
   };
 
   tilesWrap.addEventListener("mousemove", (event) => {
-    if (!isDragging || dragMode !== "clear" || !clearDragActive) return;
     const el = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
     const btn = el?.closest?.("button[data-local-idx]") as HTMLButtonElement | null;
     const idx = btn ? Number(btn.dataset.localIdx) : NaN;
+    if (selectionActive && selectionAnchor) {
+      if (!Number.isFinite(idx)) return;
+      const pos = getTilePos(idx);
+      if (!pos) return;
+      selectTilesInRect(selectionAnchor, pos);
+      return;
+    }
+    if (groupDragActive && groupDragAnchor) {
+      if (!Number.isFinite(idx)) return;
+      const pos = getTilePos(idx);
+      if (!pos) return;
+      const nextDx = pos.x - groupDragAnchor.x;
+      const nextDy = pos.y - groupDragAnchor.y;
+      if (nextDx === lastGroupDelta.dx && nextDy === lastGroupDelta.dy) return;
+      const diffDx = nextDx - lastGroupDelta.dx;
+      const diffDy = nextDy - lastGroupDelta.dy;
+      if (moveSelectedTilesBy(diffDx, diffDy)) {
+        lastGroupDelta = { dx: nextDx, dy: nextDy };
+      }
+      return;
+    }
+    if (!isDragging || dragMode !== "clear" || !clearDragActive) return;
     if (Number.isFinite(idx)) {
       clearTileByIdx(idx);
     }
@@ -1658,6 +1822,7 @@ export function renderEditorMenu(container: HTMLElement) {
         ? GardenLayoutService.normalizeMutation(String((obj as any).glcMutation))
         : "";
     const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
+    const isSelected = selectedTile === idx || selectedTiles.has(idx);
     
     cell.style.borderImage = "none";
     cell.style.borderImageSlice = "";
@@ -1667,7 +1832,7 @@ export function renderEditorMenu(container: HTMLElement) {
     } else if (isEggTile(idx)) {
       cell.style.borderColor = "#f5c542";
       cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-    } else if (selectedTile === idx) {
+    } else if (isSelected) {
       cell.style.borderColor = "#3cd17a";
       cell.style.boxShadow = "0 0 0 2px rgba(60,209,122,0.7) inset";
     } else if (blockedTiles.has(idx)) {
@@ -2024,12 +2189,14 @@ export function renderEditorMenu(container: HTMLElement) {
   tabDirt.addEventListener("click", () => {
     setActiveTab("Dirt");
     selectedTile = null;
+    clearSelectedTiles();
     updateSelectionLabel();
     refreshTiles();
   });
   tabBoard.addEventListener("click", () => {
     setActiveTab("Boardwalk");
     selectedTile = null;
+    clearSelectedTiles();
     updateSelectionLabel();
     refreshTiles();
   });
@@ -2037,6 +2204,11 @@ export function renderEditorMenu(container: HTMLElement) {
   const onMouseUp = () => {
     isDragging = false;
     clearDragActive = false;
+    selectionActive = false;
+    selectionAnchor = null;
+    groupDragActive = false;
+    groupDragAnchor = null;
+    lastGroupDelta = { dx: 0, dy: 0 };
   };
   document.addEventListener("mouseup", onMouseUp);
   cleanup = () => {

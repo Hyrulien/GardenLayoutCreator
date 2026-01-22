@@ -43,6 +43,34 @@ type InventoryCounts = {
   tools: Map<string, number>;
 };
 
+type InventoryDebugEntry = {
+  name: string;
+  quantity: number;
+  itemType: string;
+  raw?: {
+    id?: unknown;
+    toolId?: unknown;
+    itemId?: unknown;
+    name?: unknown;
+    itemName?: unknown;
+    itemType?: unknown;
+    dataName?: unknown;
+    dataId?: unknown;
+    dataToolId?: unknown;
+    dataItemId?: unknown;
+  };
+};
+
+type InventoryDebugSnapshot = {
+  itemsCount: number;
+  toolEntries: InventoryDebugEntry[];
+  potLikeEntries: InventoryDebugEntry[];
+  typeCounts: Record<string, number>;
+  toolRawItems: Array<Record<string, unknown>>;
+};
+
+let lastInventoryDebug: InventoryDebugSnapshot | null = null;
+
 type ClearTask = {
   tileType: "Dirt" | "Boardwalk";
   localIdx: number;
@@ -258,6 +286,71 @@ export const GardenLayoutService = {
       return a.id.localeCompare(b.id);
     });
     return summary;
+  },
+
+  async getPlanterPotRequirement(
+    garden: GardenState,
+    currentGarden: GardenState
+  ): Promise<{ needed: number; owned: number }> {
+    const needed = await calculatePlanterPotsNeeded(garden, currentGarden);
+    const inventory = await getInventoryCounts();
+    const owned =
+      inventory.tools.get("Planter Pot") ||
+      inventory.tools.get("PlanterPot") ||
+      0;
+    return { needed, owned };
+  },
+
+  getBlockedTargetTiles(currentGarden: GardenState, targetGarden: GardenState): number[] {
+    return getBlockedTargetTilesFromState(currentGarden, targetGarden);
+  },
+
+  getDraftRemovalTiles(
+    garden: GardenState,
+    currentGarden: GardenState
+  ): { Dirt: Set<number>; Boardwalk: Set<number> } {
+    const removal: { Dirt: Set<number>; Boardwalk: Set<number> } = {
+      Dirt: new Set(),
+      Boardwalk: new Set(),
+    };
+
+    const add = (tileType: "Dirt" | "Boardwalk", idx: number) => {
+      if (Number.isFinite(idx)) removal[tileType].add(idx);
+    };
+
+    const checkMap = (
+      tileType: "Dirt" | "Boardwalk",
+      currentMap: Record<string, any>,
+      draftMap: Record<string, any>
+    ) => {
+      const ignored = getIgnoredSet(garden, tileType);
+      for (const [key, curObj] of Object.entries(currentMap || {})) {
+        const idx = Number(key);
+        if (Number.isFinite(idx) && ignored.has(idx)) continue;
+        if (!curObj || typeof curObj !== "object") continue;
+        const draftObj = draftMap?.[key];
+        if (!draftObj || typeof draftObj !== "object") {
+          add(tileType, idx);
+          continue;
+        }
+        if (!isSameTileObject(curObj, draftObj)) {
+          add(tileType, idx);
+          continue;
+        }
+        const curType = String((curObj as any).objectType ?? (curObj as any).type ?? "").toLowerCase();
+        if (curType === "plant") {
+          const desiredMutation = getDesiredMutation(draftObj);
+          if (desiredMutation && !plantHasMutation(curObj, desiredMutation)) {
+            add(tileType, idx);
+          }
+        }
+      }
+    };
+
+    checkMap("Dirt", currentGarden.tileObjects || {}, garden.tileObjects || {});
+    checkMap("Boardwalk", currentGarden.boardwalkTileObjects || {}, garden.boardwalkTileObjects || {});
+
+    return removal;
   },
 
   resolvePlantSpecies(raw: string): string {
@@ -1276,37 +1369,127 @@ function toChunkedEntries(
 async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: GardenState): Promise<number> {
   const ignoredDirt = getIgnoredSet(garden, "Dirt");
   const aliasMap = getPlantAliasMap();
-  
-  let potsNeeded = 0;
-  
-  // Count plants in current garden that will need to be potted
+
+  const desiredBySpecies = new Map<string, number>();
+  const desiredByMutation = new Map<string, number>();
+  const inPlaceBySpecies = new Map<string, number>();
+  const inPlaceByMutation = new Map<string, number>();
+  const potSupplyBySpecies = new Map<string, number>();
+  const potSupplyByMutation = new Map<string, number>();
+
+  let potsFromTargets = 0;
+
+  const addMap = (map: Map<string, number>, key: string, qty: number) => {
+    if (!key) return;
+    map.set(key, (map.get(key) || 0) + qty);
+  };
+
+  // Build desired counts + count pots from target tiles
   for (const [key, draftObj] of Object.entries(garden.tileObjects || {})) {
     const idx = Number(key);
     if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
     if (!draftObj || typeof draftObj !== "object") continue;
-    
+
+    const desiredType = String((draftObj as any).objectType || "").toLowerCase();
+    const desiredMutation = desiredType === "plant" ? getDesiredMutation(draftObj) : null;
+    const desiredSpecies =
+      desiredType === "plant"
+        ? resolvePlantSpeciesKey(String((draftObj as any).species || (draftObj as any).seedKey || ""), aliasMap)
+        : "";
+
+    if (desiredType === "plant" && desiredSpecies) {
+      if (desiredMutation) {
+        addMap(desiredByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+      } else {
+        addMap(desiredBySpecies, desiredSpecies, 1);
+      }
+    }
+
     const curObj = (currentGarden.tileObjects || {})[key];
     if (!curObj || typeof curObj !== "object") continue;
     const curType = String((curObj as any).objectType || "").toLowerCase();
-    
-    // If current tile has a plant, count it
-    if (curType === "plant") {
-      const draftType = String((draftObj as any).objectType || "").toLowerCase();
-      // If draft wants something different than what's there, need to pot current plant
-      if (draftType === "plant") {
-        const curSpecies = resolvePlantSpeciesKey(String((curObj as any).species || (curObj as any).seedKey || ""), aliasMap);
-        const draftSpecies = resolvePlantSpeciesKey(String((draftObj as any).species || (draftObj as any).seedKey || ""), aliasMap);
-        if (curSpecies !== draftSpecies) {
-          potsNeeded += 1;
+    if (curType !== "plant") continue;
+
+    const curSpecies = resolvePlantSpeciesKey(String((curObj as any).species || (curObj as any).seedKey || ""), aliasMap);
+    const curMutations = getPlantMutations(curObj);
+    const curHasDesiredMutation = desiredMutation ? curMutations.includes(desiredMutation) : false;
+
+    let inPlace = false;
+    if (desiredType === "plant" && desiredSpecies && curSpecies === desiredSpecies) {
+      if (!desiredMutation || curHasDesiredMutation) {
+        inPlace = true;
+        if (desiredMutation) {
+          addMap(inPlaceByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+        } else {
+          addMap(inPlaceBySpecies, desiredSpecies, 1);
         }
-      } else {
-        // Draft wants decor/empty, need to pot current plant
-        potsNeeded += 1;
+      }
+    }
+
+    if (!inPlace) {
+      potsFromTargets += 1;
+      if (curSpecies) addMap(potSupplyBySpecies, curSpecies, 1);
+      for (const mut of curMutations) {
+        addMap(potSupplyByMutation, mutationKeyFor(curSpecies, mut), 1);
       }
     }
   }
-  
-  return potsNeeded;
+
+  const invPlants = await readPlantInventoryBySpecies(aliasMap);
+  const invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+
+  const invBySpecies = new Map<string, number>();
+  for (const [species, ids] of invPlants.entries()) {
+    addMap(invBySpecies, species, ids.length);
+  }
+
+  const invByMutation = new Map<string, number>();
+  for (const [species, entries] of invPlantsByMutation.entries()) {
+    for (const entry of entries) {
+      for (const mut of entry.mutations) {
+        addMap(invByMutation, mutationKeyFor(species, mut), 1);
+      }
+    }
+  }
+
+  const gardenBySpecies = countGardenPlants(currentGarden, aliasMap, ignoredDirt);
+  const gardenByMutation = countGardenPlantsByMutation(currentGarden, aliasMap, ignoredDirt);
+
+  let potsFromGarden = 0;
+
+  for (const [species, desiredCount] of desiredBySpecies.entries()) {
+    const inPlace = inPlaceBySpecies.get(species) || 0;
+    const required = Math.max(0, desiredCount - inPlace);
+    const availableInv =
+      (invBySpecies.get(species) || 0) +
+      (potSupplyBySpecies.get(species) || 0);
+    const missing = Math.max(0, required - availableInv);
+    const availableGarden = Math.max(
+      0,
+      (gardenBySpecies.get(species) || 0) -
+        inPlace -
+        (potSupplyBySpecies.get(species) || 0)
+    );
+    potsFromGarden += Math.min(missing, availableGarden);
+  }
+
+  for (const [key, desiredCount] of desiredByMutation.entries()) {
+    const inPlace = inPlaceByMutation.get(key) || 0;
+    const required = Math.max(0, desiredCount - inPlace);
+    const availableInv =
+      (invByMutation.get(key) || 0) +
+      (potSupplyByMutation.get(key) || 0);
+    const missing = Math.max(0, required - availableInv);
+    const availableGarden = Math.max(
+      0,
+      (gardenByMutation.get(key) || 0) -
+        inPlace -
+        (potSupplyByMutation.get(key) || 0)
+    );
+    potsFromGarden += Math.min(missing, availableGarden);
+  }
+
+  return potsFromTargets + potsFromGarden;
 }
 
 async function applyGardenServerWithPotting(
@@ -1322,7 +1505,17 @@ async function applyGardenServerWithPotting(
   const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
   if (potsNeeded > 0) {
     const inventory = await getInventoryCounts();
-    const potsOwned = inventory.tools.get("Planter Pot") || 0;
+    const potsOwned = inventory.tools.get("Planter Pot") || inventory.tools.get("PlanterPot") || 0;
+    try {
+      console.info("[GLC][PlanterPot] inventory check", {
+        potsNeeded,
+        potsOwned,
+        toolEntries: lastInventoryDebug?.toolEntries ?? [],
+        potLikeEntries: lastInventoryDebug?.potLikeEntries ?? [],
+        typeCounts: lastInventoryDebug?.typeCounts ?? {},
+        itemsCount: lastInventoryDebug?.itemsCount ?? 0,
+      });
+    } catch {}
     if (potsNeeded > potsOwned) {
       const missing = potsNeeded - potsOwned;
       await toastSimple(
@@ -2436,10 +2629,16 @@ async function getInventoryCounts(): Promise<InventoryCounts> {
     eggs: new Map(),
     tools: new Map(),
   };
+  const toolEntries: InventoryDebugEntry[] = [];
+  const potLikeEntries: InventoryDebugEntry[] = [];
+  const typeCounts = new Map<string, number>();
+  const toolRawItems: Array<Record<string, unknown>> = [];
+  let itemsCount = 0;
 
   try {
     const inventory = await Store.select<any>("myInventoryAtom");
     const items = extractInventoryItems(inventory);
+    itemsCount = items.length;
     const aliasMap = getPlantAliasMap();
     for (const entry of items) {
       if (!entry || typeof entry !== "object") continue;
@@ -2448,8 +2647,10 @@ async function getInventoryCounts(): Promise<InventoryCounts> {
           ? (entry as any).item
           : entry;
       if (!source || typeof source !== "object") continue;
-      const type = String(source.itemType ?? source.data?.itemType ?? "").toLowerCase();
+      const typeRaw = String(source.itemType ?? source.data?.itemType ?? "");
+      const type = typeRaw.toLowerCase();
       const quantity = Number(source.quantity ?? source.count ?? 1);
+      typeCounts.set(typeRaw || "(empty)", (typeCounts.get(typeRaw || "(empty)") || 0) + 1);
       if (type === "seed") {
         const rawSpecies = String(source.species ?? source.seedSpecies ?? source.data?.species ?? "");
         const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
@@ -2473,12 +2674,91 @@ async function getInventoryCounts(): Promise<InventoryCounts> {
         const eggId = String(source.eggId ?? source.data?.eggId ?? "");
         if (eggId) addCount(counts.eggs, eggId, quantity);
       } else if (type === "tool" || type === "item") {
-        const itemName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
-        if (itemName) addCount(counts.tools, itemName, quantity);
+        const itemName = String(
+          source.name ??
+            source.itemName ??
+            source.toolId ??
+            source.itemId ??
+            source.data?.name ??
+            source.data?.toolId ??
+            source.data?.itemId ??
+            ""
+        );
+        if (toolRawItems.length < 50) {
+          toolRawItems.push({
+            id: source.id,
+            toolId: source.toolId,
+            itemId: source.itemId,
+            name: source.name,
+            itemName: source.itemName,
+            itemType: source.itemType ?? source.data?.itemType,
+            dataName: source.data?.name,
+            dataId: source.data?.id,
+            dataToolId: source.data?.toolId,
+            dataItemId: source.data?.itemId,
+            rawKeys: Object.keys(source || {}),
+            dataKeys: source.data && typeof source.data === "object" ? Object.keys(source.data) : [],
+          });
+        }
+        if (itemName) {
+          addCount(counts.tools, itemName, quantity);
+          if (toolEntries.length < 50) {
+            toolEntries.push({
+              name: itemName,
+              quantity,
+              itemType: String(source.itemType ?? source.data?.itemType ?? ""),
+              raw: {
+                id: source.id,
+                toolId: source.toolId,
+                itemId: source.itemId,
+                name: source.name,
+                itemName: source.itemName,
+                itemType: source.itemType,
+                dataName: source.data?.name,
+                dataId: source.data?.id,
+                dataToolId: source.data?.toolId,
+                dataItemId: source.data?.itemId,
+              },
+            });
+          }
+        }
+      } else {
+        const candidateName = String(source.name ?? source.itemName ?? source.data?.name ?? "");
+        if (candidateName && /pot/i.test(candidateName)) {
+          if (potLikeEntries.length < 50) {
+            potLikeEntries.push({
+              name: candidateName,
+              quantity,
+              itemType: typeRaw,
+              raw: {
+                id: source.id,
+                  toolId: source.toolId,
+                  itemId: source.itemId,
+                name: source.name,
+                itemName: source.itemName,
+                itemType: source.itemType,
+                dataName: source.data?.name,
+                  dataId: source.data?.id,
+                  dataToolId: source.data?.toolId,
+                  dataItemId: source.data?.itemId,
+              },
+            });
+          }
+        }
       }
     }
   } catch {}
 
+  lastInventoryDebug = {
+    itemsCount,
+    toolEntries,
+    potLikeEntries,
+    typeCounts: Object.fromEntries(typeCounts),
+    toolRawItems,
+  };
+  try {
+    (window as any).__GLC_LastInventoryDebug = lastInventoryDebug;
+  } catch {}
   return counts;
 }
 

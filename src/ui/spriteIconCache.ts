@@ -11,7 +11,10 @@ const SPRITE_PRELOAD_CATEGORIES = [
   "tallplant",
   "crop",
   "decor",
+  "item",
   "pet",
+  "seed",
+  "ui",
   "mutation",
   "mutation-overlay",
 ] as const;

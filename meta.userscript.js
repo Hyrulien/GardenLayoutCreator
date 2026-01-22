@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLC - Garden Layout Creator
 // @namespace    GLC
-// @version      v1.0.1
+// @version      v1.0.2
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
