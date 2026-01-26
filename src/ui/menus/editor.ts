@@ -270,6 +270,52 @@ export function renderEditorMenu(container: HTMLElement) {
     Dawncharged: { border: "#8b5cf6", shadow: "0 0 0 2px rgba(139,92,246,0.6) inset" },
     Ambercharged: { border: "#ff7b2e", shadow: "0 0 0 2px rgba(255,123,46,0.6) inset" },
   };
+  const MUTATION_GROUPS = [
+    { id: "color", members: ["Rainbow", "Gold"] },
+    { id: "weather", members: ["Frozen", "Chilled", "Wet"] },
+    { id: "dawn", members: ["Dawncharged", "Ambercharged", "Dawnlit", "Amberlit"] },
+  ] as const;
+  const mutationGroupIndex = new Map<string, number>();
+  MUTATION_GROUPS.forEach((group, idx) => {
+    group.members.forEach((name) => mutationGroupIndex.set(name, idx));
+  });
+  const getTileMutations = (obj: any): string[] => {
+    if (!obj || typeof obj !== "object") return [];
+    const raw: string[] = [];
+    if (Array.isArray((obj as any).glcMutations)) {
+      raw.push(...(obj as any).glcMutations);
+    } else if (typeof (obj as any).glcMutation === "string") {
+      raw.push((obj as any).glcMutation);
+    }
+    const normalized = new Set<string>();
+    for (const mut of raw) {
+      const name = GardenLayoutService.normalizeMutation(String(mut || ""));
+      if (name && mutationCatalog[name as keyof typeof mutationCatalog]) {
+        normalized.add(name);
+      }
+    }
+    const ordered: string[] = [];
+    MUTATION_GROUPS.forEach((group) => {
+      for (const name of group.members) {
+        if (normalized.has(name)) {
+          ordered.push(name);
+          break;
+        }
+      }
+    });
+    return ordered.length ? ordered : Array.from(normalized.values()).slice(0, 3);
+  };
+  const setTileMutations = (obj: any, mutations: string[]) => {
+    if (!obj || typeof obj !== "object") return;
+    const list = (mutations || []).filter(Boolean);
+    if (list.length) {
+      (obj as any).glcMutations = list.slice(0, 3);
+      if ((obj as any).glcMutation) delete (obj as any).glcMutation;
+    } else {
+      if ((obj as any).glcMutations) delete (obj as any).glcMutations;
+      if ((obj as any).glcMutation) delete (obj as any).glcMutation;
+    }
+  };
   const fillSelect = (
     el: HTMLSelectElement,
     items: string[],
@@ -774,6 +820,11 @@ export function renderEditorMenu(container: HTMLElement) {
   const windowBody = windowEl?.querySelector<HTMLElement>(".w-body") ?? null;
   const windowHead = windowEl?.querySelector<HTMLElement>(".w-head") ?? null;
   const minBtn = windowHead?.querySelector<HTMLButtonElement>('[data-act="min"]') ?? null;
+  const closeBtn = windowHead?.querySelector<HTMLButtonElement>('[data-act="close"]') ?? null;
+  const onClose = () => {
+    GardenLayoutService.cancelApply();
+  };
+  closeBtn?.addEventListener("click", onClose);
   let loadoutsHidden = false;
   let layoutsNaturalHeight = 0;
   const measureNaturalHeight = () => {
@@ -1228,13 +1279,14 @@ export function renderEditorMenu(container: HTMLElement) {
   };
 
   const refreshRequirementInfo = async () => {
-    const [list, availability, mutationAvailability, decorAvailability, liveGarden] = await Promise.all([
+    const [list, linkedAvailability, decorAvailability, liveGarden] = await Promise.all([
       GardenLayoutService.getRequirementSummary(draft),
-      GardenLayoutService.getPlantAvailabilityCounts(draft.ignoredTiles),
-      GardenLayoutService.getPlantAvailabilityMutationCounts(draft.ignoredTiles),
+      GardenLayoutService.getLinkedPlantAvailability(draft),
       GardenLayoutService.getDecorAvailabilityCounts(draft.ignoredTiles),
       GardenLayoutService.getCurrentGarden(),
     ]);
+    const availability = linkedAvailability.base;
+    const mutationAvailability = linkedAvailability.mutation;
     currentGarden = liveGarden || GardenLayoutService.getEmptyGarden();
     const potRequirement = await GardenLayoutService.getPlanterPotRequirement(draft, currentGarden);
     const nextEggs: Record<"Dirt" | "Boardwalk", Set<number>> = {
@@ -1271,12 +1323,9 @@ export function renderEditorMenu(container: HTMLElement) {
       const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
       const species = GardenLayoutService.resolvePlantSpecies(rawSpecies);
       if (!species) continue;
-      const mutation =
-        typeof (obj as any).glcMutation === "string"
-          ? GardenLayoutService.normalizeMutation(String((obj as any).glcMutation))
-          : "";
-      if (mutation) {
-        const key = `${species}::${mutation}`;
+      const mutations = getTileMutations(obj);
+      if (mutations.length) {
+        const key = `${species}::${mutations.slice().sort((a, b) => a.localeCompare(b)).join("+")}`;
         const used = (plantMutationCounts.get(key) || 0) + 1;
         plantMutationCounts.set(key, used);
         const have = mutationAvailability.get(key) || 0;
@@ -1474,8 +1523,9 @@ export function renderEditorMenu(container: HTMLElement) {
     if (!obj || typeof obj !== "object") return;
     const type = String((obj as any).objectType || "").toLowerCase();
     if (type !== "plant") return;
-    if (!(obj as any).glcMutation) return;
+    if (!(obj as any).glcMutation && !(obj as any).glcMutations) return;
     delete (obj as any).glcMutation;
+    delete (obj as any).glcMutations;
     map[String(idx)] = obj;
     updateTileCell(idx);
     void refreshRequirementInfo();
@@ -1596,8 +1646,21 @@ export function renderEditorMenu(container: HTMLElement) {
             const objType = String((obj as any).objectType || "").toLowerCase();
             if (objType !== "plant") return;
             const selected = GardenLayoutService.normalizeMutation(mutationSelect.value);
-            if (!selected) delete (obj as any).glcMutation;
-            else (obj as any).glcMutation = selected;
+            if (!selected) {
+              setTileMutations(obj, []);
+            } else {
+              let muts = getTileMutations(obj);
+              if (muts.includes(selected)) {
+                muts = muts.filter((m) => m !== selected);
+              } else {
+                const groupIdx = mutationGroupIndex.get(selected);
+                if (groupIdx != null) {
+                  muts = muts.filter((m) => mutationGroupIndex.get(m) !== groupIdx);
+                }
+                muts.push(selected);
+              }
+              setTileMutations(obj, muts);
+            }
             map[String(tile.localIdx)] = obj;
             void refreshRequirementInfo();
             return;
@@ -1613,9 +1676,10 @@ export function renderEditorMenu(container: HTMLElement) {
               (obj as any).objectType === "plant" &&
               prev &&
               typeof prev === "object" &&
-              (prev as any).glcMutation
+              ((prev as any).glcMutation || (prev as any).glcMutations)
             ) {
-              (obj as any).glcMutation = (prev as any).glcMutation;
+              const prevMutations = getTileMutations(prev);
+              setTileMutations(obj, prevMutations);
             }
             map[String(tile.localIdx)] = obj;
           }
@@ -1845,15 +1909,16 @@ export function renderEditorMenu(container: HTMLElement) {
     }
 
     const occupied = !!obj;
-    const mutation =
-      obj && typeof obj === "object" && typeof (obj as any).glcMutation === "string"
-        ? GardenLayoutService.normalizeMutation(String((obj as any).glcMutation))
-        : "";
+    const mutations = obj && typeof obj === "object" ? getTileMutations(obj) : [];
     const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
     const isSelected = selectedTile === idx || selectedTiles.has(idx);
     
     cell.style.borderImage = "none";
     cell.style.borderImageSlice = "";
+    cell.style.border = "1px solid rgba(255,255,255,0.12)";
+    cell.style.backgroundImage = "none";
+    cell.style.backgroundOrigin = "";
+    cell.style.backgroundClip = "";
     if (isIgnoredTile(idx)) {
       cell.style.borderColor = "#b266ff";
       cell.style.boxShadow = "0 0 0 2px rgba(178,102,255,0.7) inset";
@@ -1866,22 +1931,34 @@ export function renderEditorMenu(container: HTMLElement) {
     } else if (blockedTiles.has(idx)) {
       cell.style.borderColor = "#f5c542";
       cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-    } else if (mutation && MUTATION_OUTLINES[mutation]) {
-      const outline = MUTATION_OUTLINES[mutation];
-      cell.style.borderColor = outline.border;
+    } else if (mutations.length) {
+        const ordered = mutations
+          .slice()
+          .sort((a, b) => (mutationGroupIndex.get(a) ?? 0) - (mutationGroupIndex.get(b) ?? 0));
+      const rings: string[] = [];
+      let ringIndex = 0;
+      for (const mutation of ordered) {
+        const outline = MUTATION_OUTLINES[mutation];
+        if (!outline) continue;
+        if (mutation === "Rainbow") {
+          cell.style.border = "2px solid transparent";
+          cell.style.borderRadius = "8px";
+          cell.style.backgroundImage =
+            "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
+          cell.style.backgroundOrigin = "border-box";
+          cell.style.backgroundClip = "padding-box, border-box";
+          ringIndex += 1;
+          continue;
+        }
+          const baseWidth = mutation === "Gold" ? 2 : 1;
+          const width = baseWidth + ringIndex;
+        rings.push(`0 0 0 ${width}px ${outline.border} inset`);
+        ringIndex += 1;
+      }
       if (isMissing) {
-        // Mutation + missing: show mutation color with red outer glow
-        cell.style.boxShadow = `${outline.shadow}, 0 0 8px 2px rgba(255,107,107,0.8)`;
-      } else {
-        cell.style.boxShadow = outline.shadow;
+        rings.push("0 0 8px 2px rgba(255,107,107,0.8)");
       }
-      if (mutation === "Rainbow") {
-        cell.style.border = "2px solid transparent";
-        cell.style.borderRadius = "8px";
-        cell.style.backgroundImage = "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
-        cell.style.backgroundOrigin = "border-box";
-        cell.style.backgroundClip = "padding-box, border-box";
-      }
+      cell.style.boxShadow = rings.length ? rings.join(", ") : "none";
     } else if (isMissing) {
       cell.style.borderColor = "#ff6b6b";
       cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
@@ -1913,6 +1990,7 @@ export function renderEditorMenu(container: HTMLElement) {
     const current = await GardenLayoutService.getCurrentGarden();
     if (current && typeof current === "object") {
       draft = stripEggs(current);
+      applyGardenMutationBorders(draft);
       syncIgnoredFromDraft();
       renderGrid();
       void refreshRequirementInfo();
@@ -1923,6 +2001,7 @@ export function renderEditorMenu(container: HTMLElement) {
   applyExternalGarden = (garden: any) => {
     if (garden && typeof garden === "object") {
       draft = stripEggs(garden);
+      applyGardenMutationBorders(draft);
       syncIgnoredFromDraft();
       renderGrid();
       void refreshRequirementInfo();
@@ -1935,10 +2014,9 @@ export function renderEditorMenu(container: HTMLElement) {
     if (type !== "plant") return obj;
     const now = Date.now();
     const matureTs = now - 1000;
-    const mutation =
-      typeof (obj as any).glcMutation === "string"
-        ? GardenLayoutService.normalizeMutation(String((obj as any).glcMutation))
-        : "";
+    const speciesId = String((obj as any).species || (obj as any).seedKey || "");
+    const maxScale = Number((plantCatalog as Record<string, any>)?.[speciesId]?.crop?.maxScale || 1);
+    const mutations = getTileMutations(obj);
     const clone = { ...(obj as any) };
     clone.plantedAt = matureTs;
     clone.maturedAt = matureTs;
@@ -1947,8 +2025,8 @@ export function renderEditorMenu(container: HTMLElement) {
         ...slot,
         startTime: matureTs,
         endTime: matureTs,
-        targetScale: slot?.targetScale ?? 1,
-        mutations: mutation ? [mutation] : Array.isArray(slot?.mutations) ? slot.mutations : [],
+        targetScale: Number.isFinite(maxScale) && maxScale > 0 ? maxScale : slot?.targetScale ?? 1,
+        mutations: mutations.length ? mutations : Array.isArray(slot?.mutations) ? slot.mutations : [],
       }));
     }
     return clone;
@@ -2227,6 +2305,7 @@ export function renderEditorMenu(container: HTMLElement) {
     if (reqRaf) window.cancelAnimationFrame(reqRaf);
     if (reqRefreshTimer) window.clearInterval(reqRefreshTimer);
     requirementsWin.remove();
+    closeBtn?.removeEventListener("click", onClose);
   };
 
   // selection is single-tile only; no explicit clear button
@@ -2336,6 +2415,47 @@ export function renderEditorMenu(container: HTMLElement) {
     }
   };
   renderPlantPickerGrid();
+
+
+  const applyGardenMutationBorders = (garden: any) => {
+    const applyToMap = (map: Record<string, any>) => {
+      for (const obj of Object.values(map || {})) {
+        if (!obj || typeof obj !== "object") continue;
+        const type = String((obj as any).objectType ?? (obj as any).type ?? "").toLowerCase();
+        if (type !== "plant") continue;
+        const rawMuts: string[] = [];
+        if (Array.isArray((obj as any).slots)) {
+          for (const slot of (obj as any).slots) {
+            if (Array.isArray(slot?.mutations)) {
+              rawMuts.push(...slot.mutations);
+            }
+          }
+        }
+        if (Array.isArray((obj as any).mutations)) {
+          rawMuts.push(...(obj as any).mutations);
+        }
+        const normalized = new Set<string>();
+        for (const mut of rawMuts) {
+          const name = GardenLayoutService.normalizeMutation(String(mut || ""));
+          if (name && mutationCatalog[name as keyof typeof mutationCatalog]) {
+            normalized.add(name);
+          }
+        }
+        const selected: string[] = [];
+        MUTATION_GROUPS.forEach((group) => {
+          for (const name of group.members) {
+            if (normalized.has(name)) {
+              selected.push(name);
+              break;
+            }
+          }
+        });
+        setTileMutations(obj, selected);
+      }
+    };
+    applyToMap(garden?.tileObjects || {});
+    applyToMap(garden?.boardwalkTileObjects || {});
+  };
 
   plantPickerBtn.addEventListener("click", () => {
     plantPickerGrid.style.display = plantPickerGrid.style.display === "none" ? "grid" : "none";

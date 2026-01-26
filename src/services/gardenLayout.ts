@@ -76,6 +76,7 @@ type InventoryDebugSnapshot = {
 };
 
 let lastInventoryDebug: InventoryDebugSnapshot | null = null;
+let applyCancelRequested = false;
 
 type ClearTask = {
   tileType: "Dirt" | "Boardwalk";
@@ -215,55 +216,20 @@ export const GardenLayoutService = {
   },
 
   async getRequirementSummary(garden: GardenState): Promise<RequirementSummary[]> {
-    const requiredPlants = new Map<string, { id: string; mutation?: string; needed: number }>();
     const requiredDecors = new Map<string, number>();
     const aliasMap = getPlantAliasMap();
 
-    const registerPlant = (id: string | null, mutation?: string | null) => {
-      if (!id) return;
-      const key = mutationKeyFor(id, mutation);
-      const entry = requiredPlants.get(key);
-      if (entry) {
-        entry.needed += 1;
-      } else {
-        requiredPlants.set(key, { id, mutation: mutation || undefined, needed: 1 });
-      }
-    };
     const registerDecor = (map: Map<string, number>, id: string | null) => {
       if (!id) return;
       map.set(id, (map.get(id) || 0) + 1);
     };
 
-    const mapEntries: Array<["Dirt" | "Boardwalk", Record<string, any>]> = [
-      ["Dirt", garden?.tileObjects || {}],
-      ["Boardwalk", garden?.boardwalkTileObjects || {}],
-    ];
-    for (const [tileType, map] of mapEntries) {
-      const ignored = getIgnoredSet(garden, tileType);
-      for (const [key, obj] of Object.entries(map)) {
-        const idx = Number(key);
-        if (Number.isFinite(idx) && ignored.has(idx)) continue;
-        if (!obj || typeof obj !== "object") continue;
-        const type = String((obj as any).objectType || "").toLowerCase();
-        if (type === "plant") {
-          const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
-          const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-          const mutation = getDesiredMutation(obj);
-          registerPlant(species || null, mutation);
-        } else if (type === "decor") {
-          const decorId = String((obj as any).decorId || (obj as any).id || "");
-          registerDecor(requiredDecors, decorId || null);
-        }
-      }
-    }
+    const requiredPlants = collectRequiredPlants(garden, aliasMap);
+    registerRequiredDecors(requiredDecors, garden);
 
     const inventory = await getInventoryCounts();
-    const inventoryMutations = await getInventoryPlantMutationCounts(aliasMap);
     const current = await getCurrentGarden();
-    const gardenPlantCounts = current ? countGardenPlants(current, aliasMap, getIgnoredSet(garden, "Dirt")) : new Map<string, number>();
-    const gardenPlantMutations = current
-      ? countGardenPlantsByMutation(current, aliasMap, getIgnoredSet(garden, "Dirt"))
-      : new Map<string, number>();
+    const linkedAvailability = await getLinkedAvailability(requiredPlants, current, aliasMap, garden);
     const gardenDecorCounts = current
       ? countGardenDecors(
           current,
@@ -275,12 +241,18 @@ export const GardenLayoutService = {
     const summary: RequirementSummary[] = [];
     for (const entry of requiredPlants.values()) {
       const id = entry.id;
-      const mutation = entry.mutation;
-      const key = mutationKeyFor(id, mutation);
-      const have = mutation
-        ? (inventoryMutations.get(key) || 0) + (gardenPlantMutations.get(key) || 0)
-        : (inventory.plants.get(id) || 0) + (gardenPlantCounts.get(id) || 0);
-      summary.push({ type: "plant", id, mutation, needed: entry.needed, have });
+      const mutations = entry.mutations;
+      const key = mutationSetKey(id, mutations);
+      const have = mutations.length
+        ? linkedAvailability.mutation.get(key) || 0
+        : linkedAvailability.base.get(id) || 0;
+      summary.push({
+        type: "plant",
+        id,
+        mutation: mutations.length ? mutations.join("+") : undefined,
+        needed: entry.needed,
+        have,
+      });
     }
     for (const [id, needed] of requiredDecors) {
       const have = (inventory.decors.get(id) || 0) + (gardenDecorCounts.get(id) || 0);
@@ -292,6 +264,15 @@ export const GardenLayoutService = {
       return a.id.localeCompare(b.id);
     });
     return summary;
+  },
+
+  async getLinkedPlantAvailability(
+    garden: GardenState
+  ): Promise<{ base: Map<string, number>; mutation: Map<string, number> }> {
+    const aliasMap = getPlantAliasMap();
+    const requiredPlants = collectRequiredPlants(garden, aliasMap);
+    const current = await getCurrentGarden();
+    return getLinkedAvailability(requiredPlants, current, aliasMap, garden);
   },
 
   async getPlanterPotRequirement(
@@ -345,8 +326,8 @@ export const GardenLayoutService = {
         }
         const curType = String((curObj as any).objectType ?? (curObj as any).type ?? "").toLowerCase();
         if (curType === "plant") {
-          const desiredMutation = getDesiredMutation(draftObj);
-          if (desiredMutation && !plantHasMutation(curObj, desiredMutation)) {
+          const desiredMutations = getDesiredMutations(draftObj);
+          if (desiredMutations.length && !plantHasMutationsInclusive(curObj, desiredMutations)) {
             add(tileType, idx);
           }
         }
@@ -697,9 +678,9 @@ export const GardenLayoutService = {
         PLANT_DISPLAY_NAME_OVERRIDES[species] ||
         plantCatalog[species]?.crop?.name ||
         plantCatalog[species]?.plant?.name;
-      const mutation = getDesiredMutation(obj);
+      const mutations = getDesiredMutations(obj);
       const base = display || species || "Plant";
-      return mutation ? `${base} (${mutation})` : base;
+      return mutations.length ? `${base} (${mutations.join("+")})` : base;
     }
     if (typ === "decor") {
       const decorId = String(obj.decorId || "");
@@ -713,6 +694,7 @@ export const GardenLayoutService = {
   },
 
   async applyGarden(garden: GardenState, opts: LayoutApplyOptions = {}): Promise<boolean> {
+    applyCancelRequested = false;
     const current = await getCurrentGarden();
     if (current) {
       const blocked = await getBlockedTargetTilesAsync(current, garden);
@@ -757,6 +739,10 @@ export const GardenLayoutService = {
     return this.applyGarden(found.garden, opts);
   },
 
+  cancelApply() {
+    applyCancelRequested = true;
+  },
+
   listPlantIds(): string[] {
     return Object.keys(plantCatalog || {});
   },
@@ -791,6 +777,163 @@ export const GardenLayoutService = {
     } catch {}
   },
 };
+
+type RequiredPlantEntry = { id: string; mutations: string[]; needed: number };
+
+function collectRequiredPlants(garden: GardenState, aliasMap: Map<string, string>): Map<string, RequiredPlantEntry> {
+  const requiredPlants = new Map<string, RequiredPlantEntry>();
+  const registerPlant = (id: string | null, mutations: string[]) => {
+    if (!id) return;
+    const key = mutationSetKey(id, mutations);
+    const entry = requiredPlants.get(key);
+    if (entry) {
+      entry.needed += 1;
+    } else {
+      requiredPlants.set(key, { id, mutations, needed: 1 });
+    }
+  };
+  const mapEntries: Array<["Dirt" | "Boardwalk", Record<string, any>]> = [
+    ["Dirt", garden?.tileObjects || {}],
+    ["Boardwalk", garden?.boardwalkTileObjects || {}],
+  ];
+  for (const [tileType, map] of mapEntries) {
+    const ignored = getIgnoredSet(garden, tileType);
+    for (const [key, obj] of Object.entries(map)) {
+      const idx = Number(key);
+      if (Number.isFinite(idx) && ignored.has(idx)) continue;
+      if (!obj || typeof obj !== "object") continue;
+      const type = String((obj as any).objectType || "").toLowerCase();
+      if (type !== "plant") continue;
+      const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
+      const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+      const mutations = getDesiredMutations(obj);
+      registerPlant(species || null, mutations);
+    }
+  }
+  return requiredPlants;
+}
+
+function registerRequiredDecors(requiredDecors: Map<string, number>, garden: GardenState): void {
+  const mapEntries: Array<["Dirt" | "Boardwalk", Record<string, any>]> = [
+    ["Dirt", garden?.tileObjects || {}],
+    ["Boardwalk", garden?.boardwalkTileObjects || {}],
+  ];
+  for (const [tileType, map] of mapEntries) {
+    const ignored = getIgnoredSet(garden, tileType);
+    for (const [key, obj] of Object.entries(map)) {
+      const idx = Number(key);
+      if (Number.isFinite(idx) && ignored.has(idx)) continue;
+      if (!obj || typeof obj !== "object") continue;
+      const type = String((obj as any).objectType || "").toLowerCase();
+      if (type !== "decor") continue;
+      const decorId = String((obj as any).decorId || (obj as any).id || "");
+      if (!decorId) continue;
+      requiredDecors.set(decorId, (requiredDecors.get(decorId) || 0) + 1);
+    }
+  }
+}
+
+async function getLinkedAvailability(
+  requiredPlants: Map<string, RequiredPlantEntry>,
+  current: GardenState | null,
+  aliasMap: Map<string, string>,
+  garden: GardenState
+): Promise<{ base: Map<string, number>; mutation: Map<string, number> }> {
+  const plantInstances = await buildPlantInstances(current, aliasMap, garden);
+  return computeLinkedAvailability(requiredPlants, plantInstances);
+}
+
+async function buildPlantInstances(
+  current: GardenState | null,
+  aliasMap: Map<string, string>,
+  garden: GardenState
+): Promise<Map<string, string[][]>> {
+  const instances = new Map<string, string[][]>();
+  const addInstance = (species: string, mutations: string[]) => {
+    if (!species) return;
+    if (!instances.has(species)) instances.set(species, []);
+    instances.get(species)!.push(mutations);
+  };
+
+  const invBySpecies = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+  for (const [species, entries] of invBySpecies.entries()) {
+    for (const entry of entries) {
+      addInstance(species, entry.mutations || []);
+    }
+  }
+
+  if (current) {
+    const ignored = getIgnoredSet(garden, "Dirt");
+    for (const [key, obj] of Object.entries(current.tileObjects || {})) {
+      const idx = Number(key);
+      if (Number.isFinite(idx) && ignored.has(idx)) continue;
+      if (!obj || typeof obj !== "object") continue;
+      const type = String((obj as any).objectType || "").toLowerCase();
+      if (type !== "plant") continue;
+      const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
+      const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+      const mutations = getPlantMutations(obj);
+      addInstance(species, mutations);
+    }
+  }
+  return instances;
+}
+
+function computeLinkedAvailability(
+  requiredPlants: Map<string, RequiredPlantEntry>,
+  plantInstances: Map<string, string[][]>
+): { base: Map<string, number>; mutation: Map<string, number> } {
+  const base = new Map<string, number>();
+  const mutation = new Map<string, number>();
+  const reqsBySpecies = new Map<
+    string,
+    { mutationReqs: Array<{ mutations: string[]; needed: number; key: string }> }
+  >();
+
+  for (const entry of requiredPlants.values()) {
+    if (!reqsBySpecies.has(entry.id)) {
+      reqsBySpecies.set(entry.id, { mutationReqs: [] });
+    }
+    if (entry.mutations.length) {
+      reqsBySpecies
+        .get(entry.id)!
+        .mutationReqs.push({ mutations: entry.mutations, needed: entry.needed, key: mutationSetKey(entry.id, entry.mutations) });
+    }
+  }
+
+  const allocatePlantsForMutationSet = (plants: string[][], required: string[], maxCount: number): number => {
+    const limit = Math.max(0, Math.floor(maxCount));
+    if (!limit) return 0;
+    const candidates = plants
+      .map((mutations, idx) => ({
+        idx,
+        len: Array.isArray(mutations) ? mutations.length : 0,
+        matches: required.every((mutationName) => hasMutation(mutations, mutationName)),
+      }))
+      .filter((candidate) => candidate.matches)
+      .sort((a, b) => a.len - b.len);
+    const selected = candidates.slice(0, limit).map((candidate) => candidate.idx).sort((a, b) => b - a);
+    for (const idx of selected) {
+      plants.splice(idx, 1);
+    }
+    return selected.length;
+  };
+
+  for (const [species, reqs] of reqsBySpecies.entries()) {
+    const plants = (plantInstances.get(species) || []).map((muts) => muts.slice());
+    const remaining = plants.slice();
+    const mutationReqs = reqs.mutationReqs
+      .slice()
+      .sort((a, b) => b.mutations.length - a.mutations.length || b.needed - a.needed);
+    for (const req of mutationReqs) {
+      const allocated = allocatePlantsForMutationSet(remaining, req.mutations, req.needed);
+      mutation.set(req.key, allocated);
+    }
+    base.set(species, remaining.length);
+  }
+
+  return { base, mutation };
+}
 
 function readLayouts(): SavedLayout[] {
   const parseList = (parsed: unknown): SavedLayout[] => {
@@ -1102,6 +1245,12 @@ function isTileOccupied(obj: any): boolean {
   return markers.some((k) => typeof (obj as any)[k] === "string" && (obj as any)[k]);
 }
 
+function hasMutationSlots(obj: any): boolean {
+  if (!obj || typeof obj !== "object") return false;
+  const slots = Array.isArray((obj as any).slots) ? (obj as any).slots : (obj as any).data?.slots;
+  return Array.isArray(slots) && slots.length > 0;
+}
+
 function isSameTileObject(a: any, b: any): boolean {
   if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
   const typeA = String((a as any).objectType ?? (a as any).type ?? "");
@@ -1411,7 +1560,9 @@ async function applyGardenServer(garden: GardenState): Promise<boolean> {
 
     const dirtEntries = toChunkedEntries(dirt);
     for (const chunk of dirtEntries) {
+      if (applyCancelRequested) return false;
       for (const [localIdx, obj] of chunk) {
+        if (applyCancelRequested) return false;
         if (!obj || typeof obj !== "object") continue;
         const typ = String((obj as any).objectType || "");
         if (typ === "plant") {
@@ -1428,6 +1579,7 @@ async function applyGardenServer(garden: GardenState): Promise<boolean> {
         }
       }
       for (const action of actions) {
+        if (applyCancelRequested) return false;
         await action();
         await delay(40);
       }
@@ -1436,7 +1588,9 @@ async function applyGardenServer(garden: GardenState): Promise<boolean> {
 
     const boardEntries = toChunkedEntries(board);
     for (const chunk of boardEntries) {
+      if (applyCancelRequested) return false;
       for (const [localIdx, obj] of chunk) {
+        if (applyCancelRequested) return false;
         if (!obj || typeof obj !== "object") continue;
         const typ = String((obj as any).objectType || "");
         if (typ !== "decor") continue;
@@ -1447,6 +1601,7 @@ async function applyGardenServer(garden: GardenState): Promise<boolean> {
         }
       }
       for (const action of actions) {
+        if (applyCancelRequested) return false;
         await action();
         await delay(40);
       }
@@ -1485,11 +1640,12 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
   const aliasMap = getPlantAliasMap();
 
   const desiredBySpecies = new Map<string, number>();
-  const desiredByMutation = new Map<string, number>();
+  const desiredByMutation = new Map<string, { mutations: string[]; count: number }>();
   const inPlaceBySpecies = new Map<string, number>();
   const inPlaceByMutation = new Map<string, number>();
   const potSupplyBySpecies = new Map<string, number>();
   const potSupplyByMutation = new Map<string, number>();
+  const potSupplyInstances = new Map<string, string[][]>();
 
   let potsFromTargets = 0;
 
@@ -1505,15 +1661,18 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
     if (!draftObj || typeof draftObj !== "object") continue;
 
     const desiredType = String((draftObj as any).objectType || "").toLowerCase();
-    const desiredMutation = desiredType === "plant" ? getDesiredMutation(draftObj) : null;
+    const desiredMutations = desiredType === "plant" ? getDesiredMutations(draftObj) : [];
     const desiredSpecies =
       desiredType === "plant"
         ? resolvePlantSpeciesKey(String((draftObj as any).species || (draftObj as any).seedKey || ""), aliasMap)
         : "";
 
     if (desiredType === "plant" && desiredSpecies) {
-      if (desiredMutation) {
-        addMap(desiredByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+      if (desiredMutations.length) {
+        const key = mutationSetKey(desiredSpecies, desiredMutations);
+        const entry = desiredByMutation.get(key);
+        if (entry) entry.count += 1;
+        else desiredByMutation.set(key, { mutations: desiredMutations, count: 1 });
       } else {
         addMap(desiredBySpecies, desiredSpecies, 1);
       }
@@ -1526,14 +1685,16 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
 
     const curSpecies = resolvePlantSpeciesKey(String((curObj as any).species || (curObj as any).seedKey || ""), aliasMap);
     const curMutations = getPlantMutations(curObj);
-    const curHasDesiredMutation = desiredMutation ? curMutations.includes(desiredMutation) : false;
+    const curHasDesiredMutation = desiredMutations.length
+      ? desiredMutations.every((mutation) => curMutations.includes(mutation))
+      : false;
 
     let inPlace = false;
     if (desiredType === "plant" && desiredSpecies && curSpecies === desiredSpecies) {
-      if (!desiredMutation || curHasDesiredMutation) {
+      if (!desiredMutations.length || curHasDesiredMutation) {
         inPlace = true;
-        if (desiredMutation) {
-          addMap(inPlaceByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+        if (desiredMutations.length) {
+          addMap(inPlaceByMutation, mutationSetKey(desiredSpecies, desiredMutations), 1);
         } else {
           addMap(inPlaceBySpecies, desiredSpecies, 1);
         }
@@ -1543,8 +1704,9 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
     if (!inPlace) {
       potsFromTargets += 1;
       if (curSpecies) addMap(potSupplyBySpecies, curSpecies, 1);
-      for (const mut of curMutations) {
-        addMap(potSupplyByMutation, mutationKeyFor(curSpecies, mut), 1);
+      if (curSpecies) {
+        if (!potSupplyInstances.has(curSpecies)) potSupplyInstances.set(curSpecies, []);
+        potSupplyInstances.get(curSpecies)!.push(curMutations);
       }
     }
   }
@@ -1558,16 +1720,39 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
   }
 
   const invByMutation = new Map<string, number>();
-  for (const [species, entries] of invPlantsByMutation.entries()) {
-    for (const entry of entries) {
-      for (const mut of entry.mutations) {
-        addMap(invByMutation, mutationKeyFor(species, mut), 1);
-      }
-    }
+  for (const [key, entry] of desiredByMutation.entries()) {
+    const species = key.split("::")[0] || "";
+    const entries = invPlantsByMutation.get(species) || [];
+    const count = entries.filter((plant) =>
+      entry.mutations.every((mutation) => plant.mutations.includes(mutation))
+    ).length;
+    invByMutation.set(key, count);
   }
 
   const gardenBySpecies = countGardenPlants(currentGarden, aliasMap, ignoredDirt);
-  const gardenByMutation = countGardenPlantsByMutation(currentGarden, aliasMap, ignoredDirt);
+  const gardenByMutation = new Map<string, number>();
+  for (const [key, entry] of desiredByMutation.entries()) {
+    const species = key.split("::")[0] || "";
+    const supply = potSupplyInstances.get(species) || [];
+    const supplyCount = supply.filter((muts) => entry.mutations.every((m) => muts.includes(m))).length;
+    potSupplyByMutation.set(key, supplyCount);
+    let count = 0;
+    for (const [idxKey, obj] of Object.entries(currentGarden.tileObjects || {})) {
+      const idx = Number(idxKey);
+      if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+      if (!obj || typeof obj !== "object") continue;
+      const type = String((obj as any).objectType || "").toLowerCase();
+      if (type !== "plant") continue;
+      const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
+      const curSpecies = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+      if (curSpecies !== species) continue;
+      const mutations = getPlantMutations(obj);
+      if (entry.mutations.every((mutation) => mutations.includes(mutation))) {
+        count += 1;
+      }
+    }
+    gardenByMutation.set(key, count);
+  }
 
   let potsFromGarden = 0;
 
@@ -1587,7 +1772,8 @@ async function calculatePlanterPotsNeeded(garden: GardenState, currentGarden: Ga
     potsFromGarden += Math.min(missing, availableGarden);
   }
 
-  for (const [key, desiredCount] of desiredByMutation.entries()) {
+  for (const [key, entry] of desiredByMutation.entries()) {
+    const desiredCount = entry.count;
     const inPlace = inPlaceByMutation.get(key) || 0;
     const required = Math.max(0, desiredCount - inPlace);
     const availableInv =
@@ -1611,12 +1797,79 @@ async function applyGardenServerWithPotting(
   blocked: number[],
   opts: { inventorySlotsAvailable?: number; allowClientSide?: boolean }
 ): Promise<boolean> {
+  const debugUsedInventory: Array<{
+    id: string;
+    species: string;
+    mutation: string | null;
+    tile: number;
+  }> = [];
+  const usedInventoryIds = new Set<string>();
+  const tileCooldowns = new Map<number, number>();
+  const pendingPlacements = new Map<number, { attempts: number }>();
+  const logInventorySnapshot = async (label: string) => {
+    try {
+      const snapshot = await readPlantInventoryDebugSnapshot();
+      const entries = snapshot.map((entry, idx) => ({
+        slot: idx,
+        id: entry.id,
+        species: entry.species,
+        rawSpecies: entry.rawSpecies,
+        itemType: entry.itemType,
+      }));
+      console.info(`[GLC GardenLayout][Apply] ${label} inventory snapshot`, entries);
+    } catch {}
+  };
+
+  const buildInventoryIndex = (map: Map<string, InventoryPlantEntry[]>) => {
+    const index = new Map<string, { species: string; mutations: string[] }>();
+    for (const [species, entries] of map.entries()) {
+      for (const entry of entries) {
+        if (usedInventoryIds.has(entry.id)) continue;
+        index.set(entry.id, { species, mutations: entry.mutations || [] });
+      }
+    }
+    return index;
+  };
+  const pruneUsedIds = (list: string[] | undefined): string[] | undefined => {
+    if (!list || !list.length || !usedInventoryIds.size) return list;
+    return list.filter((id) => !usedInventoryIds.has(id));
+  };
+  const removeUsedFromInventoryMaps = (
+    invBySpecies: Map<string, string[]>,
+    invByMutation: Map<string, InventoryPlantEntry[]>
+  ) => {
+    if (!usedInventoryIds.size) return;
+    for (const [species, entries] of invByMutation.entries()) {
+      const next = entries.filter((entry) => !usedInventoryIds.has(entry.id));
+      if (next.length !== entries.length) {
+        invByMutation.set(species, next);
+      }
+    }
+    for (const [species, ids] of invBySpecies.entries()) {
+      const next = ids.filter((id) => !usedInventoryIds.has(id));
+      if (next.length !== ids.length) {
+        invBySpecies.set(species, next);
+      }
+    }
+  };
+  let cancelNotified = false;
+  const checkCancelled = async () => {
+    if (!applyCancelRequested) return false;
+    if (!cancelNotified) {
+      cancelNotified = true;
+      await toastSimple("Garden Layout", "Apply cancelled.", "info", 2000);
+    }
+    return true;
+  };
+
+  await logInventorySnapshot("Before apply");
   const initialGarden = await getCurrentGarden();
   if (!initialGarden) return false;
   let currentGarden: GardenState = initialGarden;
 
   // Check planter pot requirements
   const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
+  if (await checkCancelled()) return false;
   if (potsNeeded > 0) {
     const inventory = await getInventoryCounts();
     const potsOwned = inventory.tools.get("Planter Pot") || inventory.tools.get("PlanterPot") || 0;
@@ -1647,6 +1900,11 @@ async function applyGardenServerWithPotting(
   let freeSlotInfo = await resolveInventoryFreeSlots();
   let availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
   let slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
+  const refreshSlotsLeft = async () => {
+    freeSlotInfo = await resolveInventoryFreeSlots();
+    availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
+    slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
+  };
 
   if (blocked.length) {
     await toastSimple("Garden Layout", "Clearing target tiles...", "info", 1800);
@@ -1655,6 +1913,8 @@ async function applyGardenServerWithPotting(
   const aliasMap = getPlantAliasMap();
   let invPlants = await readPlantInventoryBySpecies(aliasMap);
   let invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+  removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+  let invIndex = buildInventoryIndex(invPlantsByMutation);
   let inventoryDirty = false;
   let inventoryFullWarned = false;
   let eggBlockedWarned = false;
@@ -1665,7 +1925,7 @@ async function applyGardenServerWithPotting(
   const ignoredDirt = getIgnoredSet(garden, "Dirt");
   const ignoredBoardwalk = getIgnoredSet(garden, "Boardwalk");
   const desiredSpeciesBySlot = new Map<number, string>();
-  const desiredMutationBySlot = new Map<number, string | null>();
+  const desiredMutationBySlot = new Map<number, string[]>();
   const desiredDecorBySlotDirt = new Map<number, string>();
   const desiredDecorBySlotBoardwalk = new Map<number, string>();
   for (const [key, obj] of Object.entries(garden.tileObjects || {})) {
@@ -1684,9 +1944,10 @@ async function applyGardenServerWithPotting(
     const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
     const idx = Number(key);
     if (!Number.isFinite(idx) || !species) continue;
+    if (blockedSet.has(idx)) continue;
     if (ignoredDirt.has(idx)) continue;
     desiredSpeciesBySlot.set(idx, species);
-    desiredMutationBySlot.set(idx, getDesiredMutation(obj));
+    desiredMutationBySlot.set(idx, getDesiredMutations(obj));
   }
   for (const [key, obj] of Object.entries(garden.boardwalkTileObjects || {})) {
     if (!obj || typeof obj !== "object") continue;
@@ -1698,7 +1959,44 @@ async function applyGardenServerWithPotting(
       desiredDecorBySlotBoardwalk.set(idx, decorId);
     }
   }
+  const desiredKeyBySlot = new Map<number, string>();
+  const desiredCountByKey = new Map<string, number>();
+  const buildDesiredKeyMaps = () => {
+    desiredKeyBySlot.clear();
+    desiredCountByKey.clear();
+    for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+      const mutations = desiredMutationBySlot.get(idx) || [];
+      const key = mutationSetKey(species, mutations);
+      desiredKeyBySlot.set(idx, key);
+      desiredCountByKey.set(key, (desiredCountByKey.get(key) || 0) + 1);
+    }
+  };
+  const computeRemainingByKey = (currentState: GardenState) => {
+    const remaining = new Map<string, number>();
+    for (const [key, count] of desiredCountByKey.entries()) {
+      remaining.set(key, count);
+    }
+    for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+      const obj = getGardenTileObject(currentState, "Dirt", idx);
+      if (!obj || typeof obj !== "object") continue;
+      const type = String((obj as any).objectType ?? (obj as any).type ?? "").toLowerCase();
+      if (type !== "plant") continue;
+      const curSpecies = resolvePlantSpeciesKey(String((obj as any).species || (obj as any).seedKey || ""), aliasMap);
+      if (!curSpecies || curSpecies !== species) continue;
+      const desiredMutations = desiredMutationBySlot.get(idx) || [];
+      if (desiredMutations.length && !plantHasMutationsInclusive(obj, desiredMutations)) continue;
+      const key = desiredKeyBySlot.get(idx);
+      if (!key) continue;
+      const next = (remaining.get(key) || 0) - 1;
+      remaining.set(key, Math.max(0, next));
+    }
+    return remaining;
+  };
+  buildDesiredKeyMaps();
+  let remainingByKey = computeRemainingByKey(currentGarden);
+  const placedTargets = new Set<number>();
   let gardenPlants = collectGardenPlantSlots(currentGarden, aliasMap, ignoredDirt);
+  let gardenMutationSources = new Map<string, number[]>();
   let mispositionedGardenPlants = new Map<string, number[]>();
   let mispositionedGardenDecors = new Map<string, DecorSlot[]>();
   let decorCounts = new Map<string, number>();
@@ -1719,15 +2017,21 @@ async function applyGardenServerWithPotting(
   }
 
   const processTile = async (tileType: "Dirt" | "Boardwalk", localIdx: number, obj: any): Promise<boolean> => {
+    if (await checkCancelled()) return false;
     if (!obj || typeof obj !== "object") return false;
     const ignoredSet = tileType === "Dirt" ? ignoredDirt : ignoredBoardwalk;
     if (ignoredSet.has(localIdx)) return false;
     const desiredType = String(obj.objectType || "");
-    const desiredMutation = desiredType === "plant" ? getDesiredMutation(obj) : null;
+    const desiredMutations = desiredType === "plant" ? getDesiredMutations(obj) : [];
     const desiredSpecies =
       desiredType === "plant"
         ? resolvePlantSpeciesKey(String(obj.species || obj.seedKey || ""), aliasMap)
         : "";
+    const desiredKey =
+      tileType === "Dirt" && desiredType === "plant"
+        ? desiredKeyBySlot.get(localIdx) || mutationSetKey(desiredSpecies, desiredMutations)
+        : null;
+    const remainingForKey = desiredKey ? remainingByKey.get(desiredKey) || 0 : 0;
     let changed = false;
 
     if (tileType === "Boardwalk") {
@@ -1738,6 +2042,7 @@ async function applyGardenServerWithPotting(
         return false;
       }
       if (curObj) {
+        if (await checkCancelled()) return false;
         await PlayerService.pickupDecor("Boardwalk", localIdx);
         if (curDecorId) {
           addCount(decorCounts, curDecorId, 1);
@@ -1759,6 +2064,7 @@ async function applyGardenServerWithPotting(
           if (!ok) {
             return changed;
           }
+          if (await checkCancelled()) return changed;
           await PlayerService.placeDecor("Boardwalk", localIdx, decorId, Number(obj.rotation ?? 0) as any);
           await delay(40);
           changed = true;
@@ -1767,10 +2073,18 @@ async function applyGardenServerWithPotting(
       return changed;
     }
 
+    if (tileType === "Dirt" && desiredType === "plant") {
+      const cooldown = tileCooldowns.get(localIdx) || 0;
+      if (cooldown > 0) return false;
+      const pending = pendingPlacements.get(localIdx);
+      if (pending && pending.attempts < 4) return false;
+    }
     const curObj = getCurrentTileObject(currentGarden, tileType, localIdx, dirtCoords);
+    const mutationObj =
+      curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, tileType, localIdx) : curObj;
     const curType = String((curObj as any)?.objectType ?? (curObj as any)?.type ?? "");
     if (curObj && desiredType && isSameTileObject(curObj, obj)) {
-      if (!desiredMutation || plantHasMutation(curObj, desiredMutation)) {
+      if (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
         return false;
       }
     }
@@ -1780,7 +2094,7 @@ async function applyGardenServerWithPotting(
       const curSpecies = resolvePlantSpeciesKey(curRawSpecies, aliasMap);
       const desiredSpecies = resolvePlantSpeciesKey(desiredRawSpecies, aliasMap);
       if (curSpecies && desiredSpecies && curSpecies === desiredSpecies) {
-        if (!desiredMutation || plantHasMutation(curObj, desiredMutation)) {
+        if (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
           return false;
         }
       }
@@ -1788,6 +2102,9 @@ async function applyGardenServerWithPotting(
 
     if (curObj) {
       if (curType === "plant") {
+        if (slotsLeft <= 0) {
+          await refreshSlotsLeft();
+        }
         if (slotsLeft <= 0) {
           if (!inventoryFullWarned) {
             inventoryFullWarned = true;
@@ -1804,6 +2121,7 @@ async function applyGardenServerWithPotting(
           }
           return false;
         }
+        if (await checkCancelled()) return false;
         await PlayerService.potPlant(localIdx);
         slotsLeft -= 1;
         inventoryDirty = true;
@@ -1816,6 +2134,7 @@ async function applyGardenServerWithPotting(
         return false;
       } else {
         const curDecorId = String((curObj as any)?.decorId || "");
+        if (await checkCancelled()) return changed;
         await PlayerService.pickupDecor("Dirt", localIdx);
         if (curDecorId) {
           addCount(decorCounts, curDecorId, 1);
@@ -1829,17 +2148,40 @@ async function applyGardenServerWithPotting(
     if (desiredType === "plant") {
       const rawSpecies = String(obj.species || obj.seedKey || "");
       const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-      let list = desiredMutation
-        ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation)
+      let list = desiredMutations.length
+        ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations)
         : getPlantListBySpecies(invPlants, species);
+      list = pruneUsedIds(list);
+      if (desiredMutations.length && slotsLeft > 0 && remainingForKey > 0) {
+        const pottedFromGarden = await potGardenPlantsBatchWithMutations(
+          currentGarden,
+          gardenMutationSources,
+          species,
+          desiredMutations,
+          1,
+          localIdx
+        );
+        if (pottedFromGarden > 0) {
+          slotsLeft -= pottedFromGarden;
+          await delay(160);
+          invPlants = await readPlantInventoryBySpecies(aliasMap);
+          invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+          removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+          invIndex = buildInventoryIndex(invPlantsByMutation);
+          inventoryDirty = false;
+          list = getPlantListByMutations(invPlantsByMutation, species, desiredMutations);
+          list = pruneUsedIds(list);
+          changed = true;
+        }
+      }
       const mispositionedSlots = mispositionedGardenPlants.get(species) || [];
-      if (mispositionedSlots.length && slotsLeft > 0) {
-        const pottedFromGarden = desiredMutation
-          ? await potGardenPlantsBatchWithMutation(
+      if (mispositionedSlots.length && slotsLeft > 0 && remainingForKey > 0) {
+        const pottedFromGarden = desiredMutations.length
+          ? await potGardenPlantsBatchWithMutations(
               currentGarden,
               mispositionedGardenPlants,
               species,
-              desiredMutation,
+              desiredMutations,
               1,
               localIdx
             )
@@ -1849,22 +2191,29 @@ async function applyGardenServerWithPotting(
           await delay(160);
           invPlants = await readPlantInventoryBySpecies(aliasMap);
           invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+          invIndex = buildInventoryIndex(invPlantsByMutation);
           inventoryDirty = false;
-          list = desiredMutation
-            ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation)
+          list = desiredMutations.length
+            ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations)
             : getPlantListBySpecies(invPlants, species);
+          list = pruneUsedIds(list);
           changed = true;
         }
       }
       if ((!list || !list.length) && inventoryDirty) {
         invPlants = await readPlantInventoryBySpecies(aliasMap);
         invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+        invIndex = buildInventoryIndex(invPlantsByMutation);
         inventoryDirty = false;
-        list = desiredMutation
-          ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation)
+        list = desiredMutations.length
+          ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations)
           : getPlantListBySpecies(invPlants, species);
+        list = pruneUsedIds(list);
       }
       if (!list || !list.length) {
+        if (slotsLeft <= 0) {
+          await refreshSlotsLeft();
+        }
         if (slotsLeft <= 0) {
           if (!inventoryFullWarned) {
             inventoryFullWarned = true;
@@ -1881,32 +2230,66 @@ async function applyGardenServerWithPotting(
           }
           return changed;
         }
-        const potted = desiredMutation
-          ? await potGardenPlantsBatchWithMutation(
+        if (remainingForKey <= 0) {
+          return changed;
+        }
+        const potted = desiredMutations.length
+          ? await potGardenPlantsBatchWithMutations(
               currentGarden,
               gardenPlants,
               species,
-              desiredMutation,
-              slotsLeft,
+              desiredMutations,
+              Math.min(slotsLeft, remainingForKey),
               localIdx
             )
-          : await potGardenPlantsBatch(gardenPlants, species, slotsLeft, localIdx);
+          : await potGardenPlantsBatch(gardenPlants, species, Math.min(slotsLeft, remainingForKey), localIdx);
         if (potted > 0) {
           slotsLeft -= potted;
           await delay(160);
           invPlants = await readPlantInventoryBySpecies(aliasMap);
           invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+          invIndex = buildInventoryIndex(invPlantsByMutation);
           inventoryDirty = false;
-          list = desiredMutation
-            ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation)
+          list = desiredMutations.length
+            ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations)
             : getPlantListBySpecies(invPlants, species);
+          list = pruneUsedIds(list);
           changed = true;
         }
       }
       if (list && list.length) {
         const itemId = list.shift()!;
+        const invMeta = invIndex.get(itemId);
+        usedInventoryIds.add(itemId);
+        if (!consumeInventoryItem(invPlants, invPlantsByMutation, invIndex, itemId)) {
+          try {
+            console.warn("[GLC GardenLayout][Apply] Inventory item not found in cache", { itemId });
+          } catch {}
+        }
+        debugUsedInventory.push({
+          id: itemId,
+          species: invMeta?.species || species || "",
+          mutation: desiredMutations.length ? desiredMutations.join("+") : null,
+          tile: localIdx,
+        });
+        try {
+          console.info("[GLC GardenLayout][Apply] Using inventory plant", {
+            itemId,
+            species: invMeta?.species || species,
+            mutations: invMeta?.mutations || [],
+            targetTile: localIdx,
+            desiredMutation: desiredMutations.length ? desiredMutations.join("+") : null,
+          });
+        } catch {}
+        if (await checkCancelled()) return changed;
         await PlayerService.plantGardenPlant(localIdx, itemId);
+        tileCooldowns.set(localIdx, 3);
+        pendingPlacements.set(localIdx, { attempts: 0 });
         slotsLeft += 1;
+        if (desiredKey && !placedTargets.has(localIdx)) {
+          remainingByKey.set(desiredKey, Math.max(0, (remainingByKey.get(desiredKey) || 0) - 1));
+          placedTargets.add(localIdx);
+        }
         await delay(80);
         changed = true;
       } else {
@@ -1919,6 +2302,7 @@ async function applyGardenServerWithPotting(
         if (!ok) {
           return changed;
         }
+        if (await checkCancelled()) return changed;
         await PlayerService.placeDecor("Dirt", localIdx, decorId, Number(obj.rotation ?? 0) as any);
         changed = true;
       }
@@ -1932,7 +2316,8 @@ async function applyGardenServerWithPotting(
 
   try {
     const groupDirtEntries = () => {
-      const bySpecies = new Map<string, Array<[number, any]>>();
+      const byPlantKey = new Map<string, Array<[number, any]>>();
+      const plantOrder: string[] = [];
       const byDecor = new Map<string, Array<[number, any]>>();
       const others: Array<[number, any]> = [];
       for (const [localIdx, obj] of toChunkedEntries(garden.tileObjects || {}).flat()) {
@@ -1942,8 +2327,13 @@ async function applyGardenServerWithPotting(
         if (desiredType === "plant") {
           const rawSpecies = String(obj.species || obj.seedKey || "");
           const species = resolvePlantSpeciesKey(rawSpecies, aliasMap) || rawSpecies;
-          if (!bySpecies.has(species)) bySpecies.set(species, []);
-          bySpecies.get(species)!.push([localIdx, obj]);
+          const mutations = getDesiredMutations(obj);
+          const key = mutationSetKey(species, mutations);
+          if (!byPlantKey.has(key)) {
+            byPlantKey.set(key, []);
+            plantOrder.push(key);
+          }
+          byPlantKey.get(key)!.push([localIdx, obj]);
         } else if (desiredType === "decor") {
           const decorId = String(obj.decorId || "");
           if (!byDecor.has(decorId)) byDecor.set(decorId, []);
@@ -1953,11 +2343,9 @@ async function applyGardenServerWithPotting(
         }
       }
       const ordered: Array<[number, any]> = [];
-      Array.from(bySpecies.keys())
-        .sort((a, b) => a.localeCompare(b))
-        .forEach((species) => {
-          ordered.push(...bySpecies.get(species)!);
-        });
+      plantOrder.forEach((key) => {
+        ordered.push(...(byPlantKey.get(key) || []));
+      });
       Array.from(byDecor.keys())
         .sort((a, b) => a.localeCompare(b))
         .forEach((decorId) => {
@@ -1992,12 +2380,57 @@ async function applyGardenServerWithPotting(
       return ordered;
     };
 
-    const MAX_PASSES = 50;
+    const MAX_PASSES = 200;
     let finalPass = 0;
     for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+      if (await checkCancelled()) return false;
       const nextCurrent = await getCurrentGarden();
       if (!nextCurrent) break;
       currentGarden = nextCurrent;
+      remainingByKey = computeRemainingByKey(currentGarden);
+      placedTargets.clear();
+      for (const [idx, remaining] of tileCooldowns.entries()) {
+        if (remaining <= 1) tileCooldowns.delete(idx);
+        else tileCooldowns.set(idx, remaining - 1);
+      }
+      gardenMutationSources = collectGardenMutationSources(
+        currentGarden,
+        aliasMap,
+        ignoredDirt,
+        desiredSpeciesBySlot,
+        desiredMutationBySlot
+      );
+      for (const [idx, pending] of pendingPlacements.entries()) {
+        const desiredSpecies = desiredSpeciesBySlot.get(idx);
+        if (!desiredSpecies) {
+          pendingPlacements.delete(idx);
+          continue;
+        }
+        const desiredMutations = desiredMutationBySlot.get(idx) || [];
+        const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+        const mutationObj =
+          curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, "Dirt", idx) : curObj;
+        const curType = String((curObj as any)?.objectType ?? (curObj as any)?.type ?? "");
+        if (curType === "plant") {
+          const curSpecies = resolvePlantSpeciesKey(
+            String((curObj as any)?.species || (curObj as any)?.seedKey || ""),
+            aliasMap
+          );
+          if (
+            curSpecies &&
+            curSpecies === desiredSpecies &&
+            (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations))
+          ) {
+            pendingPlacements.delete(idx);
+            continue;
+          }
+        }
+        if (pending.attempts >= 4) {
+          pendingPlacements.delete(idx);
+          continue;
+        }
+        pending.attempts += 1;
+      }
       freeSlotInfo = await resolveInventoryFreeSlots();
       availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
       slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
@@ -2007,6 +2440,7 @@ async function applyGardenServerWithPotting(
         for (const [key, obj] of Object.entries(currentGarden.tileObjects || {})) {
           const idx = Number(key);
           if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+          if (blockedSet.has(idx)) continue;
           if (!obj || typeof obj !== "object") continue;
           const type = String((obj as any).objectType || "").toLowerCase();
           if (type !== "plant") continue;
@@ -2014,9 +2448,9 @@ async function applyGardenServerWithPotting(
           const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
           if (!Number.isFinite(idx) || !species) continue;
           const desired = desiredSpeciesBySlot.get(idx);
-          const desiredMutation = desiredMutationBySlot.get(idx) || null;
+          const desiredMutations = desiredMutationBySlot.get(idx) || [];
           if (desired && desired === species) {
-            if (!desiredMutation || plantHasMutation(obj, desiredMutation)) continue;
+            if (!desiredMutations.length || plantHasMutationsInclusive(obj, desiredMutations)) continue;
           }
           if (!map.has(species)) map.set(species, []);
           map.get(species)!.push(idx);
@@ -2059,12 +2493,15 @@ async function applyGardenServerWithPotting(
       if (inventoryDirty) {
         invPlants = await readPlantInventoryBySpecies(aliasMap);
         invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+        removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+        invIndex = buildInventoryIndex(invPlantsByMutation);
         inventoryDirty = false;
       }
 
       let passChanges = 0;
       const dirtEntries = groupDirtEntries();
       for (const [localIdx, obj] of dirtEntries) {
+        if (await checkCancelled()) return false;
         if (blockedSet.size && !blockedSet.has(localIdx) && !getCurrentTileObject(currentGarden, "Dirt", localIdx, dirtCoords)) {
           // empty slot, still place
         }
@@ -2072,21 +2509,71 @@ async function applyGardenServerWithPotting(
       }
       const boardEntries = groupBoardEntries();
       for (const [localIdx, obj] of boardEntries) {
+        if (await checkCancelled()) return false;
         if (await processTile("Boardwalk", localIdx, obj)) passChanges += 1;
       }
       finalPass = pass + 1;
-      if (passChanges === 0) break;
+      if (passChanges === 0) {
+        const hasPendingTargets = (() => {
+          for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+            if (blockedSet.has(idx)) continue;
+            const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+            const mutationObj =
+              curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, "Dirt", idx) : curObj;
+            const curType = String((curObj as any)?.objectType ?? (curObj as any)?.type ?? "");
+            if (curType !== "plant") return true;
+            const curSpecies = resolvePlantSpeciesKey(
+              String((curObj as any)?.species || (curObj as any)?.seedKey || ""),
+              aliasMap
+            );
+            if (!curSpecies || curSpecies !== species) return true;
+            const desiredMutations = desiredMutationBySlot.get(idx) || [];
+            if (desiredMutations.length && !plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
+              return true;
+            }
+          }
+          for (const [idx, decorId] of desiredDecorBySlotDirt.entries()) {
+            const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+            const curType = String((curObj as any)?.objectType ?? (curObj as any)?.type ?? "");
+            const curId = curType === "decor" ? String((curObj as any)?.decorId || "") : "";
+            if (!curId || curId !== decorId) return true;
+          }
+          for (const [idx, decorId] of desiredDecorBySlotBoardwalk.entries()) {
+            const curObj = getCurrentTileObject(currentGarden, "Boardwalk", idx, boardCoords);
+            const curType = String((curObj as any)?.objectType ?? (curObj as any)?.type ?? "");
+            const curId = curType === "decor" ? String((curObj as any)?.decorId || "") : "";
+            if (!curId || curId !== decorId) return true;
+          }
+          return false;
+        })();
+        if (hasPendingTargets) {
+          inventoryDirty = true;
+          await delay(400);
+          continue;
+        }
+        break;
+      }
       await delay(140);
     }
     try {
       console.log(`[GLC GardenLayout] Attempts ${finalPass}/${MAX_PASSES} finished`);
     } catch {}
+    try {
+      console.info("[GLC GardenLayout][Apply] Inventory plants used before stop", debugUsedInventory);
+    } catch {}
+    await logInventorySnapshot("After apply");
   } catch (err) {
     if (!opts.allowClientSide) return false;
     return setCurrentGarden(garden);
   }
 
   return true;
+}
+
+function getGardenTileObject(current: GardenState, tileType: "Dirt" | "Boardwalk", localIdx: number) {
+  return tileType === "Dirt"
+    ? (current.tileObjects || {})[String(localIdx)]
+    : (current.boardwalkTileObjects || {})[String(localIdx)];
 }
 
 function getCurrentTileObject(
@@ -2102,9 +2589,7 @@ function getCurrentTileObject(
       return (info as any)?.tileObject ?? null;
     }
   }
-  return tileType === "Dirt"
-    ? (current.tileObjects || {})[String(localIdx)]
-    : (current.boardwalkTileObjects || {})[String(localIdx)];
+  return getGardenTileObject(current, tileType, localIdx);
 }
 
 async function readPlantInventoryBySpecies(aliasMap: Map<string, string> = getPlantAliasMap()): Promise<Map<string, string[]>> {
@@ -2200,6 +2685,43 @@ type PlantInventoryDebugEntry = {
   rawSpecies: string;
   itemType: string;
 };
+
+function consumeInventoryItem(
+  invPlants: Map<string, string[]>,
+  invPlantsByMutation: Map<string, InventoryPlantEntry[]>,
+  invIndex: Map<string, { species: string; mutations: string[] }>,
+  itemId: string
+): boolean {
+  let matchedSpecies: string | null = null;
+  for (const [species, entries] of invPlantsByMutation.entries()) {
+    const idx = entries.findIndex((entry) => entry.id === itemId);
+    if (idx >= 0) {
+      entries.splice(idx, 1);
+      matchedSpecies = species;
+      break;
+    }
+  }
+  if (matchedSpecies) {
+    const speciesList = invPlants.get(matchedSpecies);
+    if (speciesList) {
+      const idx = speciesList.indexOf(itemId);
+      if (idx >= 0) {
+        speciesList.splice(idx, 1);
+      }
+    }
+  } else {
+    for (const [species, ids] of invPlants.entries()) {
+      const idx = ids.indexOf(itemId);
+      if (idx >= 0) {
+        ids.splice(idx, 1);
+        matchedSpecies = species;
+        break;
+      }
+    }
+  }
+  invIndex.delete(itemId);
+  return Boolean(matchedSpecies);
+}
 
 async function readPlantInventoryDebugSnapshot(): Promise<PlantInventoryDebugEntry[]> {
   const out: PlantInventoryDebugEntry[] = [];
@@ -2351,20 +2873,57 @@ function getPlantMutations(obj: any): string[] {
   return Array.from(out);
 }
 
-function getDesiredMutation(obj: any): string | null {
-  const raw = typeof obj?.glcMutation === "string" ? obj.glcMutation : "";
-  const normalized = normalizeMutationTag(raw);
-  return normalized || null;
+function hasOnlyMutation(list: unknown, mutation: string | null): boolean {
+  const normalized = normalizeMutationTag(mutation);
+  if (!normalized) return false;
+  const muts = normalizeMutationList(list);
+  return muts.length === 1 && muts[0] === normalized;
+}
+
+function hasMutation(list: unknown, mutation: string | null): boolean {
+  const normalized = normalizeMutationTag(mutation);
+  if (!normalized) return false;
+  const muts = normalizeMutationList(list);
+  return muts.includes(normalized);
+}
+
+function getDesiredMutations(obj: any): string[] {
+  if (!obj || typeof obj !== "object") return [];
+  const raw: string[] = [];
+  if (Array.isArray((obj as any).glcMutations)) {
+    raw.push(...(obj as any).glcMutations);
+  }
+  if (typeof (obj as any).glcMutation === "string") {
+    raw.push((obj as any).glcMutation);
+  }
+  return normalizeMutationList(raw);
 }
 
 function plantHasMutation(obj: any, mutation: string | null): boolean {
   if (!mutation) return false;
   const muts = getPlantMutations(obj);
-  return muts.includes(mutation);
+  return hasOnlyMutation(muts, mutation);
+}
+
+function plantHasMutationInclusive(obj: any, mutation: string | null): boolean {
+  if (!mutation) return false;
+  const muts = getPlantMutations(obj);
+  return hasMutation(muts, mutation);
+}
+
+function plantHasMutationsInclusive(obj: any, mutations: string[]): boolean {
+  if (!Array.isArray(mutations) || !mutations.length) return true;
+  const muts = getPlantMutations(obj);
+  return mutations.every((mutation) => hasMutation(muts, mutation));
 }
 
 function mutationKeyFor(species: string, mutation?: string | null): string {
   return `${species}::${mutation || ""}`;
+}
+
+function mutationSetKey(species: string, mutations: string[]): string {
+  const list = (mutations || []).slice().sort((a, b) => a.localeCompare(b));
+  return `${species}::${list.join("+")}`;
 }
 
 function getPlantListBySpecies(map: Map<string, string[]>, species: string): string[] | undefined {
@@ -2392,7 +2951,29 @@ function getPlantListByMutation(
         .filter(([key]) => normalizeSpeciesKey(key) === normalized)
         .flatMap(([, value]) => value);
   if (!entries.length) return undefined;
-  const matched = entries.filter((entry) => entry.mutations.includes(mutation)).map((entry) => entry.id);
+  const matched = entries.filter((entry) => hasMutation(entry.mutations, mutation)).map((entry) => entry.id);
+  return matched.length ? matched : undefined;
+}
+
+function getPlantListByMutations(
+  map: Map<string, InventoryPlantEntry[]>,
+  species: string,
+  mutations: string[]
+): string[] | undefined {
+  if (!species) return undefined;
+  const required = normalizeMutationList(mutations);
+  if (!required.length) return getPlantListBySpecies(map as any, species);
+  const direct = map.get(species) || [];
+  const normalized = normalizeSpeciesKey(species);
+  const entries = direct.length
+    ? direct
+    : Array.from(map.entries())
+        .filter(([key]) => normalizeSpeciesKey(key) === normalized)
+        .flatMap(([, value]) => value);
+  if (!entries.length) return undefined;
+  const matched = entries
+    .filter((entry) => required.every((mut) => hasMutation(entry.mutations, mut)))
+    .map((entry) => entry.id);
   return matched.length ? matched : undefined;
 }
 
@@ -2474,6 +3055,39 @@ function collectGardenPlantSlots(
     const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
     const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
     if (!Number.isFinite(idx)) continue;
+    if (!map.has(species)) map.set(species, []);
+    map.get(species)!.push(idx);
+  }
+  return map;
+}
+
+function collectGardenMutationSources(
+  current: GardenState,
+  aliasMap: Map<string, string>,
+  ignored: Set<number>,
+  desiredSpeciesBySlot: Map<number, string>,
+  desiredMutationBySlot: Map<number, string[]>
+): Map<string, number[]> {
+  const map = new Map<string, number[]>();
+  for (const [key, obj] of Object.entries(current.tileObjects || {})) {
+    const idx = Number(key);
+    if (Number.isFinite(idx) && ignored.has(idx)) continue;
+    if (!obj || typeof obj !== "object") continue;
+    const type = String((obj as any).objectType || "").toLowerCase();
+    if (type !== "plant") continue;
+    const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
+    const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+    if (!Number.isFinite(idx) || !species) continue;
+    const desiredSpecies = desiredSpeciesBySlot.get(idx);
+    const desiredMutations = desiredMutationBySlot.get(idx) || [];
+    if (
+      desiredSpecies &&
+      desiredSpecies === species &&
+      desiredMutations.length &&
+      plantHasMutationsInclusive(obj, desiredMutations)
+    ) {
+      continue;
+    }
     if (!map.has(species)) map.set(species, []);
     map.get(species)!.push(idx);
   }
@@ -2572,6 +3186,7 @@ async function potGardenPlantsBatch(
   let count = 0;
   const limit = Math.max(0, Math.floor(maxCount));
   while (count < limit) {
+    if (applyCancelRequested) break;
     const sourceIdx = takeGardenPlantSlot(map, species, excludeIdx);
     if (sourceIdx == null) break;
     await PlayerService.potPlant(sourceIdx);
@@ -2599,6 +3214,36 @@ function takeGardenPlantSlotWithMutation(
       return idx;
     }
   }
+  for (let i = 0; i < list.length; i++) {
+    const idx = list[i];
+    if (idx === excludeIdx) continue;
+    const obj = (current.tileObjects || {})[String(idx)];
+    if (obj && plantHasMutationInclusive(obj, mutation)) {
+      list.splice(i, 1);
+      return idx;
+    }
+  }
+  return null;
+}
+
+function takeGardenPlantSlotWithMutations(
+  current: GardenState,
+  map: Map<string, number[]>,
+  species: string,
+  mutations: string[],
+  excludeIdx: number
+): number | null {
+  const list = map.get(species);
+  if (!list || !list.length) return null;
+  for (let i = 0; i < list.length; i++) {
+    const idx = list[i];
+    if (idx === excludeIdx) continue;
+    const obj = (current.tileObjects || {})[String(idx)];
+    if (obj && plantHasMutationsInclusive(obj, mutations)) {
+      list.splice(i, 1);
+      return idx;
+    }
+  }
   return null;
 }
 
@@ -2613,7 +3258,29 @@ async function potGardenPlantsBatchWithMutation(
   let count = 0;
   const limit = Math.max(0, Math.floor(maxCount));
   while (count < limit) {
+    if (applyCancelRequested) break;
     const sourceIdx = takeGardenPlantSlotWithMutation(current, map, species, mutation, excludeIdx);
+    if (sourceIdx == null) break;
+    await PlayerService.potPlant(sourceIdx);
+    count += 1;
+    await delay(60);
+  }
+  return count;
+}
+
+async function potGardenPlantsBatchWithMutations(
+  current: GardenState,
+  map: Map<string, number[]>,
+  species: string,
+  mutations: string[],
+  maxCount: number,
+  excludeIdx: number
+): Promise<number> {
+  let count = 0;
+  const limit = Math.max(0, Math.floor(maxCount));
+  while (count < limit) {
+    if (applyCancelRequested) break;
+    const sourceIdx = takeGardenPlantSlotWithMutations(current, map, species, mutations, excludeIdx);
     if (sourceIdx == null) break;
     await PlayerService.potPlant(sourceIdx);
     count += 1;
@@ -2896,21 +3563,11 @@ function addCount(map: Map<string, number>, key: string, qty: number) {
 }
 
 async function buildMissingItems(garden: GardenState, inventory: InventoryCounts, current: GardenState | null): Promise<MissingItem[]> {
-  const requiredPlants = new Map<string, { id: string; mutation?: string; needed: number }>();
+  const aliasMap = getPlantAliasMap();
+  const requiredPlants = collectRequiredPlants(garden, aliasMap);
   const requiredDecors = new Map<string, number>();
   const requiredEggs = new Map<string, number>();
-  const aliasMap = getPlantAliasMap();
 
-  const registerPlant = (id: string | null, mutation?: string | null) => {
-    if (!id) return;
-    const key = mutationKeyFor(id, mutation);
-    const entry = requiredPlants.get(key);
-    if (entry) {
-      entry.needed += 1;
-    } else {
-      requiredPlants.set(key, { id, mutation: mutation || undefined, needed: 1 });
-    }
-  };
   const register = (map: Map<string, number>, id: string | null) => {
     if (!id) return;
     map.set(id, (map.get(id) || 0) + 1);
@@ -2927,12 +3584,7 @@ async function buildMissingItems(garden: GardenState, inventory: InventoryCounts
       if (Number.isFinite(idx) && ignored.has(idx)) continue;
       if (!obj || typeof obj !== "object") continue;
       const type = String((obj as any).objectType || "").toLowerCase();
-      if (type === "plant") {
-        const rawSpecies = String((obj as any).species || (obj as any).seedKey || "");
-        const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-        const mutation = getDesiredMutation(obj);
-        registerPlant(species || null, mutation);
-      } else if (type === "decor") {
+      if (type === "decor") {
         const decorId = String((obj as any).decorId || (obj as any).id || "");
         register(requiredDecors, decorId || null);
       } else if (type === "egg") {
@@ -2944,10 +3596,7 @@ async function buildMissingItems(garden: GardenState, inventory: InventoryCounts
 
   const missing: MissingItem[] = [];
   const gardenPlantCounts = current ? countGardenPlants(current, aliasMap, getIgnoredSet(garden, "Dirt")) : new Map<string, number>();
-  const gardenPlantMutations = current
-    ? countGardenPlantsByMutation(current, aliasMap, getIgnoredSet(garden, "Dirt"))
-    : new Map<string, number>();
-  const inventoryMutationCounts = await getInventoryPlantMutationCounts(aliasMap);
+  const linkedAvailability = await getLinkedAvailability(requiredPlants, current, aliasMap, garden);
   const gardenDecorCounts = current
     ? countGardenDecors(
         current,
@@ -2957,13 +3606,19 @@ async function buildMissingItems(garden: GardenState, inventory: InventoryCounts
     : new Map<string, number>();
   for (const entry of requiredPlants.values()) {
     const id = entry.id;
-    const mutation = entry.mutation;
-    const key = mutationKeyFor(id, mutation);
-    const have = mutation
-      ? (inventoryMutationCounts.get(key) || 0) + (gardenPlantMutations.get(key) || 0)
+    const mutations = entry.mutations;
+    const key = mutationSetKey(id, mutations);
+    const have = mutations.length
+      ? linkedAvailability.mutation.get(key) || 0
       : (inventory.plants.get(id) || 0) + (gardenPlantCounts.get(id) || 0);
     if (have < entry.needed) {
-      missing.push({ type: "plant", id, mutation: mutation || undefined, needed: entry.needed, have });
+      missing.push({
+        type: "plant",
+        id,
+        mutation: mutations.length ? mutations.join("+") : undefined,
+        needed: entry.needed,
+        have,
+      });
     }
   }
   for (const [id, needed] of requiredDecors) {

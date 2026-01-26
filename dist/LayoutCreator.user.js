@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLC - Garden Layout Creator
 // @namespace    GLC
-// @version      v1.0.3
+// @version      v1.0.4
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -6198,6 +6198,7 @@
 
   // src/services/gardenLayout.ts
   var lastInventoryDebug = null;
+  var applyCancelRequested = false;
   var ARIES_LAYOUTS_PATH = "editor.savedGardens";
   var LEGACY_LAYOUTS_PATH = "editor.savedLayouts";
   var LEGACY_LAYOUTS_KEY = "qws:editor:saved-layouts";
@@ -6302,50 +6303,17 @@
       return true;
     },
     async getRequirementSummary(garden) {
-      const requiredPlants = /* @__PURE__ */ new Map();
       const requiredDecors = /* @__PURE__ */ new Map();
       const aliasMap = getPlantAliasMap();
-      const registerPlant = (id, mutation) => {
-        if (!id) return;
-        const key = mutationKeyFor(id, mutation);
-        const entry = requiredPlants.get(key);
-        if (entry) {
-          entry.needed += 1;
-        } else {
-          requiredPlants.set(key, { id, mutation: mutation || void 0, needed: 1 });
-        }
-      };
       const registerDecor = (map, id) => {
         if (!id) return;
         map.set(id, (map.get(id) || 0) + 1);
       };
-      const mapEntries = [
-        ["Dirt", garden?.tileObjects || {}],
-        ["Boardwalk", garden?.boardwalkTileObjects || {}]
-      ];
-      for (const [tileType, map] of mapEntries) {
-        const ignored = getIgnoredSet(garden, tileType);
-        for (const [key, obj] of Object.entries(map)) {
-          const idx = Number(key);
-          if (Number.isFinite(idx) && ignored.has(idx)) continue;
-          if (!obj || typeof obj !== "object") continue;
-          const type = String(obj.objectType || "").toLowerCase();
-          if (type === "plant") {
-            const rawSpecies = String(obj.species || obj.seedKey || "");
-            const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-            const mutation = getDesiredMutation(obj);
-            registerPlant(species || null, mutation);
-          } else if (type === "decor") {
-            const decorId = String(obj.decorId || obj.id || "");
-            registerDecor(requiredDecors, decorId || null);
-          }
-        }
-      }
+      const requiredPlants = collectRequiredPlants(garden, aliasMap);
+      registerRequiredDecors(requiredDecors, garden);
       const inventory = await getInventoryCounts();
-      const inventoryMutations = await getInventoryPlantMutationCounts(aliasMap);
       const current = await getCurrentGarden();
-      const gardenPlantCounts = current ? countGardenPlants(current, aliasMap, getIgnoredSet(garden, "Dirt")) : /* @__PURE__ */ new Map();
-      const gardenPlantMutations = current ? countGardenPlantsByMutation(current, aliasMap, getIgnoredSet(garden, "Dirt")) : /* @__PURE__ */ new Map();
+      const linkedAvailability = await getLinkedAvailability(requiredPlants, current, aliasMap, garden);
       const gardenDecorCounts = current ? countGardenDecors(
         current,
         getIgnoredSet(garden, "Dirt"),
@@ -6354,10 +6322,16 @@
       const summary = [];
       for (const entry of requiredPlants.values()) {
         const id = entry.id;
-        const mutation = entry.mutation;
-        const key = mutationKeyFor(id, mutation);
-        const have = mutation ? (inventoryMutations.get(key) || 0) + (gardenPlantMutations.get(key) || 0) : (inventory.plants.get(id) || 0) + (gardenPlantCounts.get(id) || 0);
-        summary.push({ type: "plant", id, mutation, needed: entry.needed, have });
+        const mutations = entry.mutations;
+        const key = mutationSetKey(id, mutations);
+        const have = mutations.length ? linkedAvailability.mutation.get(key) || 0 : linkedAvailability.base.get(id) || 0;
+        summary.push({
+          type: "plant",
+          id,
+          mutation: mutations.length ? mutations.join("+") : void 0,
+          needed: entry.needed,
+          have
+        });
       }
       for (const [id, needed] of requiredDecors) {
         const have = (inventory.decors.get(id) || 0) + (gardenDecorCounts.get(id) || 0);
@@ -6368,6 +6342,12 @@
         return a.id.localeCompare(b.id);
       });
       return summary;
+    },
+    async getLinkedPlantAvailability(garden) {
+      const aliasMap = getPlantAliasMap();
+      const requiredPlants = collectRequiredPlants(garden, aliasMap);
+      const current = await getCurrentGarden();
+      return getLinkedAvailability(requiredPlants, current, aliasMap, garden);
     },
     async getPlanterPotRequirement(garden, currentGarden) {
       const needed = await calculatePlanterPotsNeeded(garden, currentGarden);
@@ -6403,8 +6383,8 @@
           }
           const curType = String(curObj.objectType ?? curObj.type ?? "").toLowerCase();
           if (curType === "plant") {
-            const desiredMutation = getDesiredMutation(draftObj);
-            if (desiredMutation && !plantHasMutation(curObj, desiredMutation)) {
+            const desiredMutations = getDesiredMutations(draftObj);
+            if (desiredMutations.length && !plantHasMutationsInclusive(curObj, desiredMutations)) {
               add(tileType, idx);
             }
           }
@@ -6696,9 +6676,9 @@
       if (typ === "plant") {
         const species = String(obj.species || "");
         const display = PLANT_DISPLAY_NAME_OVERRIDES[species] || plantCatalog[species]?.crop?.name || plantCatalog[species]?.plant?.name;
-        const mutation = getDesiredMutation(obj);
+        const mutations = getDesiredMutations(obj);
         const base = display || species || "Plant";
-        return mutation ? `${base} (${mutation})` : base;
+        return mutations.length ? `${base} (${mutations.join("+")})` : base;
       }
       if (typ === "decor") {
         const decorId = String(obj.decorId || "");
@@ -6711,6 +6691,7 @@
       return "Item";
     },
     async applyGarden(garden, opts = {}) {
+      applyCancelRequested = false;
       const current = await getCurrentGarden();
       if (current) {
         const blocked = await getBlockedTargetTilesAsync(current, garden);
@@ -6749,6 +6730,9 @@
       if (!found) return false;
       return this.applyGarden(found.garden, opts);
     },
+    cancelApply() {
+      applyCancelRequested = true;
+    },
     listPlantIds() {
       return Object.keys(plantCatalog || {});
     },
@@ -6778,6 +6762,128 @@
       }
     }
   };
+  function collectRequiredPlants(garden, aliasMap) {
+    const requiredPlants = /* @__PURE__ */ new Map();
+    const registerPlant = (id, mutations) => {
+      if (!id) return;
+      const key = mutationSetKey(id, mutations);
+      const entry = requiredPlants.get(key);
+      if (entry) {
+        entry.needed += 1;
+      } else {
+        requiredPlants.set(key, { id, mutations, needed: 1 });
+      }
+    };
+    const mapEntries = [
+      ["Dirt", garden?.tileObjects || {}],
+      ["Boardwalk", garden?.boardwalkTileObjects || {}]
+    ];
+    for (const [tileType, map] of mapEntries) {
+      const ignored = getIgnoredSet(garden, tileType);
+      for (const [key, obj] of Object.entries(map)) {
+        const idx = Number(key);
+        if (Number.isFinite(idx) && ignored.has(idx)) continue;
+        if (!obj || typeof obj !== "object") continue;
+        const type = String(obj.objectType || "").toLowerCase();
+        if (type !== "plant") continue;
+        const rawSpecies = String(obj.species || obj.seedKey || "");
+        const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+        const mutations = getDesiredMutations(obj);
+        registerPlant(species || null, mutations);
+      }
+    }
+    return requiredPlants;
+  }
+  function registerRequiredDecors(requiredDecors, garden) {
+    const mapEntries = [
+      ["Dirt", garden?.tileObjects || {}],
+      ["Boardwalk", garden?.boardwalkTileObjects || {}]
+    ];
+    for (const [tileType, map] of mapEntries) {
+      const ignored = getIgnoredSet(garden, tileType);
+      for (const [key, obj] of Object.entries(map)) {
+        const idx = Number(key);
+        if (Number.isFinite(idx) && ignored.has(idx)) continue;
+        if (!obj || typeof obj !== "object") continue;
+        const type = String(obj.objectType || "").toLowerCase();
+        if (type !== "decor") continue;
+        const decorId = String(obj.decorId || obj.id || "");
+        if (!decorId) continue;
+        requiredDecors.set(decorId, (requiredDecors.get(decorId) || 0) + 1);
+      }
+    }
+  }
+  async function getLinkedAvailability(requiredPlants, current, aliasMap, garden) {
+    const plantInstances = await buildPlantInstances(current, aliasMap, garden);
+    return computeLinkedAvailability(requiredPlants, plantInstances);
+  }
+  async function buildPlantInstances(current, aliasMap, garden) {
+    const instances = /* @__PURE__ */ new Map();
+    const addInstance = (species, mutations) => {
+      if (!species) return;
+      if (!instances.has(species)) instances.set(species, []);
+      instances.get(species).push(mutations);
+    };
+    const invBySpecies = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+    for (const [species, entries] of invBySpecies.entries()) {
+      for (const entry of entries) {
+        addInstance(species, entry.mutations || []);
+      }
+    }
+    if (current) {
+      const ignored = getIgnoredSet(garden, "Dirt");
+      for (const [key, obj] of Object.entries(current.tileObjects || {})) {
+        const idx = Number(key);
+        if (Number.isFinite(idx) && ignored.has(idx)) continue;
+        if (!obj || typeof obj !== "object") continue;
+        const type = String(obj.objectType || "").toLowerCase();
+        if (type !== "plant") continue;
+        const rawSpecies = String(obj.species || obj.seedKey || "");
+        const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+        const mutations = getPlantMutations(obj);
+        addInstance(species, mutations);
+      }
+    }
+    return instances;
+  }
+  function computeLinkedAvailability(requiredPlants, plantInstances) {
+    const base = /* @__PURE__ */ new Map();
+    const mutation = /* @__PURE__ */ new Map();
+    const reqsBySpecies = /* @__PURE__ */ new Map();
+    for (const entry of requiredPlants.values()) {
+      if (!reqsBySpecies.has(entry.id)) {
+        reqsBySpecies.set(entry.id, { mutationReqs: [] });
+      }
+      if (entry.mutations.length) {
+        reqsBySpecies.get(entry.id).mutationReqs.push({ mutations: entry.mutations, needed: entry.needed, key: mutationSetKey(entry.id, entry.mutations) });
+      }
+    }
+    const allocatePlantsForMutationSet = (plants, required, maxCount) => {
+      const limit = Math.max(0, Math.floor(maxCount));
+      if (!limit) return 0;
+      const candidates = plants.map((mutations, idx) => ({
+        idx,
+        len: Array.isArray(mutations) ? mutations.length : 0,
+        matches: required.every((mutationName) => hasMutation(mutations, mutationName))
+      })).filter((candidate) => candidate.matches).sort((a, b) => a.len - b.len);
+      const selected = candidates.slice(0, limit).map((candidate) => candidate.idx).sort((a, b) => b - a);
+      for (const idx of selected) {
+        plants.splice(idx, 1);
+      }
+      return selected.length;
+    };
+    for (const [species, reqs] of reqsBySpecies.entries()) {
+      const plants = (plantInstances.get(species) || []).map((muts) => muts.slice());
+      const remaining = plants.slice();
+      const mutationReqs = reqs.mutationReqs.slice().sort((a, b) => b.mutations.length - a.mutations.length || b.needed - a.needed);
+      for (const req of mutationReqs) {
+        const allocated = allocatePlantsForMutationSet(remaining, req.mutations, req.needed);
+        mutation.set(req.key, allocated);
+      }
+      base.set(species, remaining.length);
+    }
+    return { base, mutation };
+  }
   function readLayouts() {
     const parseList = (parsed) => {
       const arr = Array.isArray(parsed) ? parsed : [];
@@ -7021,6 +7127,11 @@
     const markers = ["species", "seedKey", "decorId", "eggId"];
     return markers.some((k) => typeof obj[k] === "string" && obj[k]);
   }
+  function hasMutationSlots(obj) {
+    if (!obj || typeof obj !== "object") return false;
+    const slots = Array.isArray(obj.slots) ? obj.slots : obj.data?.slots;
+    return Array.isArray(slots) && slots.length > 0;
+  }
   function isSameTileObject(a, b) {
     if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
     const typeA = String(a.objectType ?? a.type ?? "");
@@ -7251,7 +7362,9 @@
       const actions = [];
       const dirtEntries = toChunkedEntries(dirt);
       for (const chunk of dirtEntries) {
+        if (applyCancelRequested) return false;
         for (const [localIdx, obj] of chunk) {
+          if (applyCancelRequested) return false;
           if (!obj || typeof obj !== "object") continue;
           const typ = String(obj.objectType || "");
           if (typ === "plant") {
@@ -7268,6 +7381,7 @@
           }
         }
         for (const action of actions) {
+          if (applyCancelRequested) return false;
           await action();
           await delay(40);
         }
@@ -7275,7 +7389,9 @@
       }
       const boardEntries = toChunkedEntries(board);
       for (const chunk of boardEntries) {
+        if (applyCancelRequested) return false;
         for (const [localIdx, obj] of chunk) {
+          if (applyCancelRequested) return false;
           if (!obj || typeof obj !== "object") continue;
           const typ = String(obj.objectType || "");
           if (typ !== "decor") continue;
@@ -7286,6 +7402,7 @@
           }
         }
         for (const action of actions) {
+          if (applyCancelRequested) return false;
           await action();
           await delay(40);
         }
@@ -7322,6 +7439,7 @@
     const inPlaceByMutation = /* @__PURE__ */ new Map();
     const potSupplyBySpecies = /* @__PURE__ */ new Map();
     const potSupplyByMutation = /* @__PURE__ */ new Map();
+    const potSupplyInstances = /* @__PURE__ */ new Map();
     let potsFromTargets = 0;
     const addMap = (map, key, qty) => {
       if (!key) return;
@@ -7332,11 +7450,14 @@
       if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
       if (!draftObj || typeof draftObj !== "object") continue;
       const desiredType = String(draftObj.objectType || "").toLowerCase();
-      const desiredMutation = desiredType === "plant" ? getDesiredMutation(draftObj) : null;
+      const desiredMutations = desiredType === "plant" ? getDesiredMutations(draftObj) : [];
       const desiredSpecies = desiredType === "plant" ? resolvePlantSpeciesKey(String(draftObj.species || draftObj.seedKey || ""), aliasMap) : "";
       if (desiredType === "plant" && desiredSpecies) {
-        if (desiredMutation) {
-          addMap(desiredByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+        if (desiredMutations.length) {
+          const key2 = mutationSetKey(desiredSpecies, desiredMutations);
+          const entry = desiredByMutation.get(key2);
+          if (entry) entry.count += 1;
+          else desiredByMutation.set(key2, { mutations: desiredMutations, count: 1 });
         } else {
           addMap(desiredBySpecies, desiredSpecies, 1);
         }
@@ -7347,13 +7468,13 @@
       if (curType !== "plant") continue;
       const curSpecies = resolvePlantSpeciesKey(String(curObj.species || curObj.seedKey || ""), aliasMap);
       const curMutations = getPlantMutations(curObj);
-      const curHasDesiredMutation = desiredMutation ? curMutations.includes(desiredMutation) : false;
+      const curHasDesiredMutation = desiredMutations.length ? desiredMutations.every((mutation) => curMutations.includes(mutation)) : false;
       let inPlace = false;
       if (desiredType === "plant" && desiredSpecies && curSpecies === desiredSpecies) {
-        if (!desiredMutation || curHasDesiredMutation) {
+        if (!desiredMutations.length || curHasDesiredMutation) {
           inPlace = true;
-          if (desiredMutation) {
-            addMap(inPlaceByMutation, mutationKeyFor(desiredSpecies, desiredMutation), 1);
+          if (desiredMutations.length) {
+            addMap(inPlaceByMutation, mutationSetKey(desiredSpecies, desiredMutations), 1);
           } else {
             addMap(inPlaceBySpecies, desiredSpecies, 1);
           }
@@ -7362,8 +7483,9 @@
       if (!inPlace) {
         potsFromTargets += 1;
         if (curSpecies) addMap(potSupplyBySpecies, curSpecies, 1);
-        for (const mut of curMutations) {
-          addMap(potSupplyByMutation, mutationKeyFor(curSpecies, mut), 1);
+        if (curSpecies) {
+          if (!potSupplyInstances.has(curSpecies)) potSupplyInstances.set(curSpecies, []);
+          potSupplyInstances.get(curSpecies).push(curMutations);
         }
       }
     }
@@ -7374,15 +7496,38 @@
       addMap(invBySpecies, species, ids.length);
     }
     const invByMutation = /* @__PURE__ */ new Map();
-    for (const [species, entries] of invPlantsByMutation.entries()) {
-      for (const entry of entries) {
-        for (const mut of entry.mutations) {
-          addMap(invByMutation, mutationKeyFor(species, mut), 1);
-        }
-      }
+    for (const [key, entry] of desiredByMutation.entries()) {
+      const species = key.split("::")[0] || "";
+      const entries = invPlantsByMutation.get(species) || [];
+      const count = entries.filter(
+        (plant) => entry.mutations.every((mutation) => plant.mutations.includes(mutation))
+      ).length;
+      invByMutation.set(key, count);
     }
     const gardenBySpecies = countGardenPlants(currentGarden, aliasMap, ignoredDirt);
-    const gardenByMutation = countGardenPlantsByMutation(currentGarden, aliasMap, ignoredDirt);
+    const gardenByMutation = /* @__PURE__ */ new Map();
+    for (const [key, entry] of desiredByMutation.entries()) {
+      const species = key.split("::")[0] || "";
+      const supply = potSupplyInstances.get(species) || [];
+      const supplyCount = supply.filter((muts) => entry.mutations.every((m) => muts.includes(m))).length;
+      potSupplyByMutation.set(key, supplyCount);
+      let count = 0;
+      for (const [idxKey, obj] of Object.entries(currentGarden.tileObjects || {})) {
+        const idx = Number(idxKey);
+        if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+        if (!obj || typeof obj !== "object") continue;
+        const type = String(obj.objectType || "").toLowerCase();
+        if (type !== "plant") continue;
+        const rawSpecies = String(obj.species || obj.seedKey || "");
+        const curSpecies = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+        if (curSpecies !== species) continue;
+        const mutations = getPlantMutations(obj);
+        if (entry.mutations.every((mutation) => mutations.includes(mutation))) {
+          count += 1;
+        }
+      }
+      gardenByMutation.set(key, count);
+    }
     let potsFromGarden = 0;
     for (const [species, desiredCount] of desiredBySpecies.entries()) {
       const inPlace = inPlaceBySpecies.get(species) || 0;
@@ -7395,7 +7540,8 @@
       );
       potsFromGarden += Math.min(missing, availableGarden);
     }
-    for (const [key, desiredCount] of desiredByMutation.entries()) {
+    for (const [key, entry] of desiredByMutation.entries()) {
+      const desiredCount = entry.count;
       const inPlace = inPlaceByMutation.get(key) || 0;
       const required = Math.max(0, desiredCount - inPlace);
       const availableInv = (invByMutation.get(key) || 0) + (potSupplyByMutation.get(key) || 0);
@@ -7409,10 +7555,68 @@
     return potsFromTargets + potsFromGarden;
   }
   async function applyGardenServerWithPotting(garden, blocked, opts) {
+    const debugUsedInventory = [];
+    const usedInventoryIds = /* @__PURE__ */ new Set();
+    const tileCooldowns = /* @__PURE__ */ new Map();
+    const pendingPlacements = /* @__PURE__ */ new Map();
+    const logInventorySnapshot = async (label) => {
+      try {
+        const snapshot = await readPlantInventoryDebugSnapshot();
+        const entries = snapshot.map((entry, idx) => ({
+          slot: idx,
+          id: entry.id,
+          species: entry.species,
+          rawSpecies: entry.rawSpecies,
+          itemType: entry.itemType
+        }));
+        console.info(`[GLC GardenLayout][Apply] ${label} inventory snapshot`, entries);
+      } catch {
+      }
+    };
+    const buildInventoryIndex = (map) => {
+      const index = /* @__PURE__ */ new Map();
+      for (const [species, entries] of map.entries()) {
+        for (const entry of entries) {
+          if (usedInventoryIds.has(entry.id)) continue;
+          index.set(entry.id, { species, mutations: entry.mutations || [] });
+        }
+      }
+      return index;
+    };
+    const pruneUsedIds = (list) => {
+      if (!list || !list.length || !usedInventoryIds.size) return list;
+      return list.filter((id) => !usedInventoryIds.has(id));
+    };
+    const removeUsedFromInventoryMaps = (invBySpecies, invByMutation) => {
+      if (!usedInventoryIds.size) return;
+      for (const [species, entries] of invByMutation.entries()) {
+        const next = entries.filter((entry) => !usedInventoryIds.has(entry.id));
+        if (next.length !== entries.length) {
+          invByMutation.set(species, next);
+        }
+      }
+      for (const [species, ids] of invBySpecies.entries()) {
+        const next = ids.filter((id) => !usedInventoryIds.has(id));
+        if (next.length !== ids.length) {
+          invBySpecies.set(species, next);
+        }
+      }
+    };
+    let cancelNotified = false;
+    const checkCancelled = async () => {
+      if (!applyCancelRequested) return false;
+      if (!cancelNotified) {
+        cancelNotified = true;
+        await toastSimple("Garden Layout", "Apply cancelled.", "info", 2e3);
+      }
+      return true;
+    };
+    await logInventorySnapshot("Before apply");
     const initialGarden = await getCurrentGarden();
     if (!initialGarden) return false;
     let currentGarden = initialGarden;
     const potsNeeded = await calculatePlanterPotsNeeded(garden, currentGarden);
+    if (await checkCancelled()) return false;
     if (potsNeeded > 0) {
       const inventory = await getInventoryCounts();
       const potsOwned = inventory.tools.get("Planter Pot") || inventory.tools.get("PlanterPot") || 0;
@@ -7443,12 +7647,19 @@
     let freeSlotInfo = await resolveInventoryFreeSlots();
     let availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
     let slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
+    const refreshSlotsLeft = async () => {
+      freeSlotInfo = await resolveInventoryFreeSlots();
+      availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
+      slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
+    };
     if (blocked.length) {
       await toastSimple("Garden Layout", "Clearing target tiles...", "info", 1800);
     }
     const aliasMap = getPlantAliasMap();
     let invPlants = await readPlantInventoryBySpecies(aliasMap);
     let invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+    removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+    let invIndex = buildInventoryIndex(invPlantsByMutation);
     let inventoryDirty = false;
     let inventoryFullWarned = false;
     let eggBlockedWarned = false;
@@ -7478,9 +7689,10 @@
       const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
       const idx = Number(key);
       if (!Number.isFinite(idx) || !species) continue;
+      if (blockedSet.has(idx)) continue;
       if (ignoredDirt.has(idx)) continue;
       desiredSpeciesBySlot.set(idx, species);
-      desiredMutationBySlot.set(idx, getDesiredMutation(obj));
+      desiredMutationBySlot.set(idx, getDesiredMutations(obj));
     }
     for (const [key, obj] of Object.entries(garden.boardwalkTileObjects || {})) {
       if (!obj || typeof obj !== "object") continue;
@@ -7492,7 +7704,44 @@
         desiredDecorBySlotBoardwalk.set(idx, decorId);
       }
     }
+    const desiredKeyBySlot = /* @__PURE__ */ new Map();
+    const desiredCountByKey = /* @__PURE__ */ new Map();
+    const buildDesiredKeyMaps = () => {
+      desiredKeyBySlot.clear();
+      desiredCountByKey.clear();
+      for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+        const mutations = desiredMutationBySlot.get(idx) || [];
+        const key = mutationSetKey(species, mutations);
+        desiredKeyBySlot.set(idx, key);
+        desiredCountByKey.set(key, (desiredCountByKey.get(key) || 0) + 1);
+      }
+    };
+    const computeRemainingByKey = (currentState) => {
+      const remaining = /* @__PURE__ */ new Map();
+      for (const [key, count] of desiredCountByKey.entries()) {
+        remaining.set(key, count);
+      }
+      for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+        const obj = getGardenTileObject(currentState, "Dirt", idx);
+        if (!obj || typeof obj !== "object") continue;
+        const type = String(obj.objectType ?? obj.type ?? "").toLowerCase();
+        if (type !== "plant") continue;
+        const curSpecies = resolvePlantSpeciesKey(String(obj.species || obj.seedKey || ""), aliasMap);
+        if (!curSpecies || curSpecies !== species) continue;
+        const desiredMutations = desiredMutationBySlot.get(idx) || [];
+        if (desiredMutations.length && !plantHasMutationsInclusive(obj, desiredMutations)) continue;
+        const key = desiredKeyBySlot.get(idx);
+        if (!key) continue;
+        const next = (remaining.get(key) || 0) - 1;
+        remaining.set(key, Math.max(0, next));
+      }
+      return remaining;
+    };
+    buildDesiredKeyMaps();
+    let remainingByKey = computeRemainingByKey(currentGarden);
+    const placedTargets = /* @__PURE__ */ new Set();
     let gardenPlants = collectGardenPlantSlots(currentGarden, aliasMap, ignoredDirt);
+    let gardenMutationSources = /* @__PURE__ */ new Map();
     let mispositionedGardenPlants = /* @__PURE__ */ new Map();
     let mispositionedGardenDecors = /* @__PURE__ */ new Map();
     let decorCounts = /* @__PURE__ */ new Map();
@@ -7511,12 +7760,15 @@
       }
     }
     const processTile = async (tileType, localIdx, obj) => {
+      if (await checkCancelled()) return false;
       if (!obj || typeof obj !== "object") return false;
       const ignoredSet = tileType === "Dirt" ? ignoredDirt : ignoredBoardwalk;
       if (ignoredSet.has(localIdx)) return false;
       const desiredType = String(obj.objectType || "");
-      const desiredMutation = desiredType === "plant" ? getDesiredMutation(obj) : null;
+      const desiredMutations = desiredType === "plant" ? getDesiredMutations(obj) : [];
       const desiredSpecies = desiredType === "plant" ? resolvePlantSpeciesKey(String(obj.species || obj.seedKey || ""), aliasMap) : "";
+      const desiredKey = tileType === "Dirt" && desiredType === "plant" ? desiredKeyBySlot.get(localIdx) || mutationSetKey(desiredSpecies, desiredMutations) : null;
+      const remainingForKey = desiredKey ? remainingByKey.get(desiredKey) || 0 : 0;
       let changed = false;
       if (tileType === "Boardwalk") {
         const curObj2 = getCurrentTileObject(currentGarden, tileType, localIdx, boardCoords);
@@ -7526,6 +7778,7 @@
           return false;
         }
         if (curObj2) {
+          if (await checkCancelled()) return false;
           await PlayerService.pickupDecor("Boardwalk", localIdx);
           if (curDecorId) {
             addCount(decorCounts, curDecorId, 1);
@@ -7547,6 +7800,7 @@
             if (!ok) {
               return changed;
             }
+            if (await checkCancelled()) return changed;
             await PlayerService.placeDecor("Boardwalk", localIdx, decorId, Number(obj.rotation ?? 0));
             await delay(40);
             changed = true;
@@ -7554,10 +7808,17 @@
         }
         return changed;
       }
+      if (tileType === "Dirt" && desiredType === "plant") {
+        const cooldown = tileCooldowns.get(localIdx) || 0;
+        if (cooldown > 0) return false;
+        const pending = pendingPlacements.get(localIdx);
+        if (pending && pending.attempts < 4) return false;
+      }
       const curObj = getCurrentTileObject(currentGarden, tileType, localIdx, dirtCoords);
+      const mutationObj = curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, tileType, localIdx) : curObj;
       const curType = String(curObj?.objectType ?? curObj?.type ?? "");
       if (curObj && desiredType && isSameTileObject(curObj, obj)) {
-        if (!desiredMutation || plantHasMutation(curObj, desiredMutation)) {
+        if (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
           return false;
         }
       }
@@ -7567,13 +7828,16 @@
         const curSpecies = resolvePlantSpeciesKey(curRawSpecies, aliasMap);
         const desiredSpecies2 = resolvePlantSpeciesKey(desiredRawSpecies, aliasMap);
         if (curSpecies && desiredSpecies2 && curSpecies === desiredSpecies2) {
-          if (!desiredMutation || plantHasMutation(curObj, desiredMutation)) {
+          if (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
             return false;
           }
         }
       }
       if (curObj) {
         if (curType === "plant") {
+          if (slotsLeft <= 0) {
+            await refreshSlotsLeft();
+          }
           if (slotsLeft <= 0) {
             if (!inventoryFullWarned) {
               inventoryFullWarned = true;
@@ -7591,6 +7855,7 @@
             }
             return false;
           }
+          if (await checkCancelled()) return false;
           await PlayerService.potPlant(localIdx);
           slotsLeft -= 1;
           inventoryDirty = true;
@@ -7603,6 +7868,7 @@
           return false;
         } else {
           const curDecorId = String(curObj?.decorId || "");
+          if (await checkCancelled()) return changed;
           await PlayerService.pickupDecor("Dirt", localIdx);
           if (curDecorId) {
             addCount(decorCounts, curDecorId, 1);
@@ -7615,14 +7881,37 @@
       if (desiredType === "plant") {
         const rawSpecies = String(obj.species || obj.seedKey || "");
         const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-        let list = desiredMutation ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation) : getPlantListBySpecies(invPlants, species);
+        let list = desiredMutations.length ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations) : getPlantListBySpecies(invPlants, species);
+        list = pruneUsedIds(list);
+        if (desiredMutations.length && slotsLeft > 0 && remainingForKey > 0) {
+          const pottedFromGarden = await potGardenPlantsBatchWithMutations(
+            currentGarden,
+            gardenMutationSources,
+            species,
+            desiredMutations,
+            1,
+            localIdx
+          );
+          if (pottedFromGarden > 0) {
+            slotsLeft -= pottedFromGarden;
+            await delay(160);
+            invPlants = await readPlantInventoryBySpecies(aliasMap);
+            invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+            removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+            invIndex = buildInventoryIndex(invPlantsByMutation);
+            inventoryDirty = false;
+            list = getPlantListByMutations(invPlantsByMutation, species, desiredMutations);
+            list = pruneUsedIds(list);
+            changed = true;
+          }
+        }
         const mispositionedSlots = mispositionedGardenPlants.get(species) || [];
-        if (mispositionedSlots.length && slotsLeft > 0) {
-          const pottedFromGarden = desiredMutation ? await potGardenPlantsBatchWithMutation(
+        if (mispositionedSlots.length && slotsLeft > 0 && remainingForKey > 0) {
+          const pottedFromGarden = desiredMutations.length ? await potGardenPlantsBatchWithMutations(
             currentGarden,
             mispositionedGardenPlants,
             species,
-            desiredMutation,
+            desiredMutations,
             1,
             localIdx
           ) : await potGardenPlantsBatch(mispositionedGardenPlants, species, 1, localIdx);
@@ -7631,18 +7920,25 @@
             await delay(160);
             invPlants = await readPlantInventoryBySpecies(aliasMap);
             invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+            invIndex = buildInventoryIndex(invPlantsByMutation);
             inventoryDirty = false;
-            list = desiredMutation ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation) : getPlantListBySpecies(invPlants, species);
+            list = desiredMutations.length ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations) : getPlantListBySpecies(invPlants, species);
+            list = pruneUsedIds(list);
             changed = true;
           }
         }
         if ((!list || !list.length) && inventoryDirty) {
           invPlants = await readPlantInventoryBySpecies(aliasMap);
           invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+          invIndex = buildInventoryIndex(invPlantsByMutation);
           inventoryDirty = false;
-          list = desiredMutation ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation) : getPlantListBySpecies(invPlants, species);
+          list = desiredMutations.length ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations) : getPlantListBySpecies(invPlants, species);
+          list = pruneUsedIds(list);
         }
         if (!list || !list.length) {
+          if (slotsLeft <= 0) {
+            await refreshSlotsLeft();
+          }
           if (slotsLeft <= 0) {
             if (!inventoryFullWarned) {
               inventoryFullWarned = true;
@@ -7660,28 +7956,64 @@
             }
             return changed;
           }
-          const potted = desiredMutation ? await potGardenPlantsBatchWithMutation(
+          if (remainingForKey <= 0) {
+            return changed;
+          }
+          const potted = desiredMutations.length ? await potGardenPlantsBatchWithMutations(
             currentGarden,
             gardenPlants,
             species,
-            desiredMutation,
-            slotsLeft,
+            desiredMutations,
+            Math.min(slotsLeft, remainingForKey),
             localIdx
-          ) : await potGardenPlantsBatch(gardenPlants, species, slotsLeft, localIdx);
+          ) : await potGardenPlantsBatch(gardenPlants, species, Math.min(slotsLeft, remainingForKey), localIdx);
           if (potted > 0) {
             slotsLeft -= potted;
             await delay(160);
             invPlants = await readPlantInventoryBySpecies(aliasMap);
             invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+            invIndex = buildInventoryIndex(invPlantsByMutation);
             inventoryDirty = false;
-            list = desiredMutation ? getPlantListByMutation(invPlantsByMutation, species, desiredMutation) : getPlantListBySpecies(invPlants, species);
+            list = desiredMutations.length ? getPlantListByMutations(invPlantsByMutation, species, desiredMutations) : getPlantListBySpecies(invPlants, species);
+            list = pruneUsedIds(list);
             changed = true;
           }
         }
         if (list && list.length) {
           const itemId = list.shift();
+          const invMeta = invIndex.get(itemId);
+          usedInventoryIds.add(itemId);
+          if (!consumeInventoryItem(invPlants, invPlantsByMutation, invIndex, itemId)) {
+            try {
+              console.warn("[GLC GardenLayout][Apply] Inventory item not found in cache", { itemId });
+            } catch {
+            }
+          }
+          debugUsedInventory.push({
+            id: itemId,
+            species: invMeta?.species || species || "",
+            mutation: desiredMutations.length ? desiredMutations.join("+") : null,
+            tile: localIdx
+          });
+          try {
+            console.info("[GLC GardenLayout][Apply] Using inventory plant", {
+              itemId,
+              species: invMeta?.species || species,
+              mutations: invMeta?.mutations || [],
+              targetTile: localIdx,
+              desiredMutation: desiredMutations.length ? desiredMutations.join("+") : null
+            });
+          } catch {
+          }
+          if (await checkCancelled()) return changed;
           await PlayerService.plantGardenPlant(localIdx, itemId);
+          tileCooldowns.set(localIdx, 3);
+          pendingPlacements.set(localIdx, { attempts: 0 });
           slotsLeft += 1;
+          if (desiredKey && !placedTargets.has(localIdx)) {
+            remainingByKey.set(desiredKey, Math.max(0, (remainingByKey.get(desiredKey) || 0) - 1));
+            placedTargets.add(localIdx);
+          }
           await delay(80);
           changed = true;
         } else {
@@ -7694,6 +8026,7 @@
           if (!ok) {
             return changed;
           }
+          if (await checkCancelled()) return changed;
           await PlayerService.placeDecor("Dirt", localIdx, decorId, Number(obj.rotation ?? 0));
           changed = true;
         }
@@ -7705,7 +8038,8 @@
     };
     try {
       const groupDirtEntries = () => {
-        const bySpecies = /* @__PURE__ */ new Map();
+        const byPlantKey = /* @__PURE__ */ new Map();
+        const plantOrder = [];
         const byDecor = /* @__PURE__ */ new Map();
         const others = [];
         for (const [localIdx, obj] of toChunkedEntries(garden.tileObjects || {}).flat()) {
@@ -7715,8 +8049,13 @@
           if (desiredType === "plant") {
             const rawSpecies = String(obj.species || obj.seedKey || "");
             const species = resolvePlantSpeciesKey(rawSpecies, aliasMap) || rawSpecies;
-            if (!bySpecies.has(species)) bySpecies.set(species, []);
-            bySpecies.get(species).push([localIdx, obj]);
+            const mutations = getDesiredMutations(obj);
+            const key = mutationSetKey(species, mutations);
+            if (!byPlantKey.has(key)) {
+              byPlantKey.set(key, []);
+              plantOrder.push(key);
+            }
+            byPlantKey.get(key).push([localIdx, obj]);
           } else if (desiredType === "decor") {
             const decorId = String(obj.decorId || "");
             if (!byDecor.has(decorId)) byDecor.set(decorId, []);
@@ -7726,8 +8065,8 @@
           }
         }
         const ordered = [];
-        Array.from(bySpecies.keys()).sort((a, b) => a.localeCompare(b)).forEach((species) => {
-          ordered.push(...bySpecies.get(species));
+        plantOrder.forEach((key) => {
+          ordered.push(...byPlantKey.get(key) || []);
         });
         Array.from(byDecor.keys()).sort((a, b) => a.localeCompare(b)).forEach((decorId) => {
           ordered.push(...byDecor.get(decorId));
@@ -7757,12 +8096,52 @@
         ordered.push(...others);
         return ordered;
       };
-      const MAX_PASSES = 50;
+      const MAX_PASSES = 200;
       let finalPass = 0;
       for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+        if (await checkCancelled()) return false;
         const nextCurrent = await getCurrentGarden();
         if (!nextCurrent) break;
         currentGarden = nextCurrent;
+        remainingByKey = computeRemainingByKey(currentGarden);
+        placedTargets.clear();
+        for (const [idx, remaining] of tileCooldowns.entries()) {
+          if (remaining <= 1) tileCooldowns.delete(idx);
+          else tileCooldowns.set(idx, remaining - 1);
+        }
+        gardenMutationSources = collectGardenMutationSources(
+          currentGarden,
+          aliasMap,
+          ignoredDirt,
+          desiredSpeciesBySlot,
+          desiredMutationBySlot
+        );
+        for (const [idx, pending] of pendingPlacements.entries()) {
+          const desiredSpecies = desiredSpeciesBySlot.get(idx);
+          if (!desiredSpecies) {
+            pendingPlacements.delete(idx);
+            continue;
+          }
+          const desiredMutations = desiredMutationBySlot.get(idx) || [];
+          const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+          const mutationObj = curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, "Dirt", idx) : curObj;
+          const curType = String(curObj?.objectType ?? curObj?.type ?? "");
+          if (curType === "plant") {
+            const curSpecies = resolvePlantSpeciesKey(
+              String(curObj?.species || curObj?.seedKey || ""),
+              aliasMap
+            );
+            if (curSpecies && curSpecies === desiredSpecies && (!desiredMutations.length || plantHasMutationsInclusive(mutationObj || curObj, desiredMutations))) {
+              pendingPlacements.delete(idx);
+              continue;
+            }
+          }
+          if (pending.attempts >= 4) {
+            pendingPlacements.delete(idx);
+            continue;
+          }
+          pending.attempts += 1;
+        }
         freeSlotInfo = await resolveInventoryFreeSlots();
         availableSlots = freeSlotInfo?.freeSlots ?? configuredSlots;
         slotsLeft = Number.isFinite(availableSlots) ? availableSlots : 0;
@@ -7772,6 +8151,7 @@
           for (const [key, obj] of Object.entries(currentGarden.tileObjects || {})) {
             const idx = Number(key);
             if (Number.isFinite(idx) && ignoredDirt.has(idx)) continue;
+            if (blockedSet.has(idx)) continue;
             if (!obj || typeof obj !== "object") continue;
             const type = String(obj.objectType || "").toLowerCase();
             if (type !== "plant") continue;
@@ -7779,9 +8159,9 @@
             const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
             if (!Number.isFinite(idx) || !species) continue;
             const desired = desiredSpeciesBySlot.get(idx);
-            const desiredMutation = desiredMutationBySlot.get(idx) || null;
+            const desiredMutations = desiredMutationBySlot.get(idx) || [];
             if (desired && desired === species) {
-              if (!desiredMutation || plantHasMutation(obj, desiredMutation)) continue;
+              if (!desiredMutations.length || plantHasMutationsInclusive(obj, desiredMutations)) continue;
             }
             if (!map.has(species)) map.set(species, []);
             map.get(species).push(idx);
@@ -7819,32 +8199,82 @@
         if (inventoryDirty) {
           invPlants = await readPlantInventoryBySpecies(aliasMap);
           invPlantsByMutation = await readPlantInventoryBySpeciesWithMutations(aliasMap);
+          removeUsedFromInventoryMaps(invPlants, invPlantsByMutation);
+          invIndex = buildInventoryIndex(invPlantsByMutation);
           inventoryDirty = false;
         }
         let passChanges = 0;
         const dirtEntries = groupDirtEntries();
         for (const [localIdx, obj] of dirtEntries) {
+          if (await checkCancelled()) return false;
           if (blockedSet.size && !blockedSet.has(localIdx) && !getCurrentTileObject(currentGarden, "Dirt", localIdx, dirtCoords)) {
           }
           if (await processTile("Dirt", localIdx, obj)) passChanges += 1;
         }
         const boardEntries = groupBoardEntries();
         for (const [localIdx, obj] of boardEntries) {
+          if (await checkCancelled()) return false;
           if (await processTile("Boardwalk", localIdx, obj)) passChanges += 1;
         }
         finalPass = pass + 1;
-        if (passChanges === 0) break;
+        if (passChanges === 0) {
+          const hasPendingTargets = (() => {
+            for (const [idx, species] of desiredSpeciesBySlot.entries()) {
+              if (blockedSet.has(idx)) continue;
+              const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+              const mutationObj = curObj && !hasMutationSlots(curObj) ? getGardenTileObject(currentGarden, "Dirt", idx) : curObj;
+              const curType = String(curObj?.objectType ?? curObj?.type ?? "");
+              if (curType !== "plant") return true;
+              const curSpecies = resolvePlantSpeciesKey(
+                String(curObj?.species || curObj?.seedKey || ""),
+                aliasMap
+              );
+              if (!curSpecies || curSpecies !== species) return true;
+              const desiredMutations = desiredMutationBySlot.get(idx) || [];
+              if (desiredMutations.length && !plantHasMutationsInclusive(mutationObj || curObj, desiredMutations)) {
+                return true;
+              }
+            }
+            for (const [idx, decorId] of desiredDecorBySlotDirt.entries()) {
+              const curObj = getCurrentTileObject(currentGarden, "Dirt", idx, dirtCoords);
+              const curType = String(curObj?.objectType ?? curObj?.type ?? "");
+              const curId = curType === "decor" ? String(curObj?.decorId || "") : "";
+              if (!curId || curId !== decorId) return true;
+            }
+            for (const [idx, decorId] of desiredDecorBySlotBoardwalk.entries()) {
+              const curObj = getCurrentTileObject(currentGarden, "Boardwalk", idx, boardCoords);
+              const curType = String(curObj?.objectType ?? curObj?.type ?? "");
+              const curId = curType === "decor" ? String(curObj?.decorId || "") : "";
+              if (!curId || curId !== decorId) return true;
+            }
+            return false;
+          })();
+          if (hasPendingTargets) {
+            inventoryDirty = true;
+            await delay(400);
+            continue;
+          }
+          break;
+        }
         await delay(140);
       }
       try {
         console.log(`[GLC GardenLayout] Attempts ${finalPass}/${MAX_PASSES} finished`);
       } catch {
       }
+      try {
+        console.info("[GLC GardenLayout][Apply] Inventory plants used before stop", debugUsedInventory);
+      } catch {
+      }
+      await logInventorySnapshot("After apply");
     } catch (err) {
       if (!opts.allowClientSide) return false;
       return setCurrentGarden(garden);
     }
     return true;
+  }
+  function getGardenTileObject(current, tileType, localIdx) {
+    return tileType === "Dirt" ? (current.tileObjects || {})[String(localIdx)] : (current.boardwalkTileObjects || {})[String(localIdx)];
   }
   function getCurrentTileObject(current, tileType, localIdx, coordMap) {
     if (tos.isReady()) {
@@ -7854,7 +8284,7 @@
         return info?.tileObject ?? null;
       }
     }
-    return tileType === "Dirt" ? (current.tileObjects || {})[String(localIdx)] : (current.boardwalkTileObjects || {})[String(localIdx)];
+    return getGardenTileObject(current, tileType, localIdx);
   }
   async function readPlantInventoryBySpecies(aliasMap = getPlantAliasMap()) {
     const map = /* @__PURE__ */ new Map();
@@ -7913,6 +8343,37 @@
     } catch {
     }
     return map;
+  }
+  function consumeInventoryItem(invPlants, invPlantsByMutation, invIndex, itemId) {
+    let matchedSpecies = null;
+    for (const [species, entries] of invPlantsByMutation.entries()) {
+      const idx = entries.findIndex((entry) => entry.id === itemId);
+      if (idx >= 0) {
+        entries.splice(idx, 1);
+        matchedSpecies = species;
+        break;
+      }
+    }
+    if (matchedSpecies) {
+      const speciesList = invPlants.get(matchedSpecies);
+      if (speciesList) {
+        const idx = speciesList.indexOf(itemId);
+        if (idx >= 0) {
+          speciesList.splice(idx, 1);
+        }
+      }
+    } else {
+      for (const [species, ids] of invPlants.entries()) {
+        const idx = ids.indexOf(itemId);
+        if (idx >= 0) {
+          ids.splice(idx, 1);
+          matchedSpecies = species;
+          break;
+        }
+      }
+    }
+    invIndex.delete(itemId);
+    return Boolean(matchedSpecies);
   }
   async function readPlantInventoryDebugSnapshot() {
     const out = [];
@@ -8038,18 +8499,34 @@
     }
     return Array.from(out);
   }
-  function getDesiredMutation(obj) {
-    const raw = typeof obj?.glcMutation === "string" ? obj.glcMutation : "";
-    const normalized = normalizeMutationTag(raw);
-    return normalized || null;
+  function hasMutation(list, mutation) {
+    const normalized = normalizeMutationTag(mutation);
+    if (!normalized) return false;
+    const muts = normalizeMutationList(list);
+    return muts.includes(normalized);
   }
-  function plantHasMutation(obj, mutation) {
-    if (!mutation) return false;
+  function getDesiredMutations(obj) {
+    if (!obj || typeof obj !== "object") return [];
+    const raw = [];
+    if (Array.isArray(obj.glcMutations)) {
+      raw.push(...obj.glcMutations);
+    }
+    if (typeof obj.glcMutation === "string") {
+      raw.push(obj.glcMutation);
+    }
+    return normalizeMutationList(raw);
+  }
+  function plantHasMutationsInclusive(obj, mutations) {
+    if (!Array.isArray(mutations) || !mutations.length) return true;
     const muts = getPlantMutations(obj);
-    return muts.includes(mutation);
+    return mutations.every((mutation) => hasMutation(muts, mutation));
   }
   function mutationKeyFor(species, mutation) {
     return `${species}::${mutation || ""}`;
+  }
+  function mutationSetKey(species, mutations) {
+    const list = (mutations || []).slice().sort((a, b) => a.localeCompare(b));
+    return `${species}::${list.join("+")}`;
   }
   function getPlantListBySpecies(map, species) {
     if (!species) return void 0;
@@ -8061,13 +8538,15 @@
     }
     return void 0;
   }
-  function getPlantListByMutation(map, species, mutation) {
-    if (!species || !mutation) return void 0;
+  function getPlantListByMutations(map, species, mutations) {
+    if (!species) return void 0;
+    const required = normalizeMutationList(mutations);
+    if (!required.length) return getPlantListBySpecies(map, species);
     const direct = map.get(species) || [];
     const normalized = normalizeSpeciesKey(species);
     const entries = direct.length ? direct : Array.from(map.entries()).filter(([key]) => normalizeSpeciesKey(key) === normalized).flatMap(([, value]) => value);
     if (!entries.length) return void 0;
-    const matched = entries.filter((entry) => entry.mutations.includes(mutation)).map((entry) => entry.id);
+    const matched = entries.filter((entry) => required.every((mut) => hasMutation(entry.mutations, mut))).map((entry) => entry.id);
     return matched.length ? matched : void 0;
   }
   function countGardenPlants(current, aliasMap, ignored = /* @__PURE__ */ new Set()) {
@@ -8134,6 +8613,27 @@
     }
     return map;
   }
+  function collectGardenMutationSources(current, aliasMap, ignored, desiredSpeciesBySlot, desiredMutationBySlot) {
+    const map = /* @__PURE__ */ new Map();
+    for (const [key, obj] of Object.entries(current.tileObjects || {})) {
+      const idx = Number(key);
+      if (Number.isFinite(idx) && ignored.has(idx)) continue;
+      if (!obj || typeof obj !== "object") continue;
+      const type = String(obj.objectType || "").toLowerCase();
+      if (type !== "plant") continue;
+      const rawSpecies = String(obj.species || obj.seedKey || "");
+      const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
+      if (!Number.isFinite(idx) || !species) continue;
+      const desiredSpecies = desiredSpeciesBySlot.get(idx);
+      const desiredMutations = desiredMutationBySlot.get(idx) || [];
+      if (desiredSpecies && desiredSpecies === species && desiredMutations.length && plantHasMutationsInclusive(obj, desiredMutations)) {
+        continue;
+      }
+      if (!map.has(species)) map.set(species, []);
+      map.get(species).push(idx);
+    }
+    return map;
+  }
   function removeGardenDecorSlot(map, decorId, tileType, localIdx) {
     const list = map.get(decorId);
     if (!list || !list.length) return;
@@ -8174,6 +8674,7 @@
     let count = 0;
     const limit = Math.max(0, Math.floor(maxCount));
     while (count < limit) {
+      if (applyCancelRequested) break;
       const sourceIdx = takeGardenPlantSlot(map, species, excludeIdx);
       if (sourceIdx == null) break;
       await PlayerService.potPlant(sourceIdx);
@@ -8182,25 +8683,26 @@
     }
     return count;
   }
-  function takeGardenPlantSlotWithMutation(current, map, species, mutation, excludeIdx) {
+  function takeGardenPlantSlotWithMutations(current, map, species, mutations, excludeIdx) {
     const list = map.get(species);
     if (!list || !list.length) return null;
     for (let i = 0; i < list.length; i++) {
       const idx = list[i];
       if (idx === excludeIdx) continue;
       const obj = (current.tileObjects || {})[String(idx)];
-      if (obj && plantHasMutation(obj, mutation)) {
+      if (obj && plantHasMutationsInclusive(obj, mutations)) {
         list.splice(i, 1);
         return idx;
       }
     }
     return null;
   }
-  async function potGardenPlantsBatchWithMutation(current, map, species, mutation, maxCount, excludeIdx) {
+  async function potGardenPlantsBatchWithMutations(current, map, species, mutations, maxCount, excludeIdx) {
     let count = 0;
     const limit = Math.max(0, Math.floor(maxCount));
     while (count < limit) {
-      const sourceIdx = takeGardenPlantSlotWithMutation(current, map, species, mutation, excludeIdx);
+      if (applyCancelRequested) break;
+      const sourceIdx = takeGardenPlantSlotWithMutations(current, map, species, mutations, excludeIdx);
       if (sourceIdx == null) break;
       await PlayerService.potPlant(sourceIdx);
       count += 1;
@@ -8442,20 +8944,10 @@
     map.set(key, (map.get(key) || 0) + q);
   }
   async function buildMissingItems(garden, inventory, current) {
-    const requiredPlants = /* @__PURE__ */ new Map();
+    const aliasMap = getPlantAliasMap();
+    const requiredPlants = collectRequiredPlants(garden, aliasMap);
     const requiredDecors = /* @__PURE__ */ new Map();
     const requiredEggs = /* @__PURE__ */ new Map();
-    const aliasMap = getPlantAliasMap();
-    const registerPlant = (id, mutation) => {
-      if (!id) return;
-      const key = mutationKeyFor(id, mutation);
-      const entry = requiredPlants.get(key);
-      if (entry) {
-        entry.needed += 1;
-      } else {
-        requiredPlants.set(key, { id, mutation: mutation || void 0, needed: 1 });
-      }
-    };
     const register = (map, id) => {
       if (!id) return;
       map.set(id, (map.get(id) || 0) + 1);
@@ -8471,12 +8963,7 @@
         if (Number.isFinite(idx) && ignored.has(idx)) continue;
         if (!obj || typeof obj !== "object") continue;
         const type = String(obj.objectType || "").toLowerCase();
-        if (type === "plant") {
-          const rawSpecies = String(obj.species || obj.seedKey || "");
-          const species = resolvePlantSpeciesKey(rawSpecies, aliasMap);
-          const mutation = getDesiredMutation(obj);
-          registerPlant(species || null, mutation);
-        } else if (type === "decor") {
+        if (type === "decor") {
           const decorId = String(obj.decorId || obj.id || "");
           register(requiredDecors, decorId || null);
         } else if (type === "egg") {
@@ -8487,8 +8974,7 @@
     }
     const missing = [];
     const gardenPlantCounts = current ? countGardenPlants(current, aliasMap, getIgnoredSet(garden, "Dirt")) : /* @__PURE__ */ new Map();
-    const gardenPlantMutations = current ? countGardenPlantsByMutation(current, aliasMap, getIgnoredSet(garden, "Dirt")) : /* @__PURE__ */ new Map();
-    const inventoryMutationCounts = await getInventoryPlantMutationCounts(aliasMap);
+    const linkedAvailability = await getLinkedAvailability(requiredPlants, current, aliasMap, garden);
     const gardenDecorCounts = current ? countGardenDecors(
       current,
       getIgnoredSet(garden, "Dirt"),
@@ -8496,11 +8982,17 @@
     ) : /* @__PURE__ */ new Map();
     for (const entry of requiredPlants.values()) {
       const id = entry.id;
-      const mutation = entry.mutation;
-      const key = mutationKeyFor(id, mutation);
-      const have = mutation ? (inventoryMutationCounts.get(key) || 0) + (gardenPlantMutations.get(key) || 0) : (inventory.plants.get(id) || 0) + (gardenPlantCounts.get(id) || 0);
+      const mutations = entry.mutations;
+      const key = mutationSetKey(id, mutations);
+      const have = mutations.length ? linkedAvailability.mutation.get(key) || 0 : (inventory.plants.get(id) || 0) + (gardenPlantCounts.get(id) || 0);
       if (have < entry.needed) {
-        missing.push({ type: "plant", id, mutation: mutation || void 0, needed: entry.needed, have });
+        missing.push({
+          type: "plant",
+          id,
+          mutation: mutations.length ? mutations.join("+") : void 0,
+          needed: entry.needed,
+          have
+        });
       }
     }
     for (const [id, needed] of requiredDecors) {
@@ -9404,6 +9896,52 @@
         Dawncharged: { border: "#8b5cf6", shadow: "0 0 0 2px rgba(139,92,246,0.6) inset" },
         Ambercharged: { border: "#ff7b2e", shadow: "0 0 0 2px rgba(255,123,46,0.6) inset" }
       };
+      const MUTATION_GROUPS = [
+        { id: "color", members: ["Rainbow", "Gold"] },
+        { id: "weather", members: ["Frozen", "Chilled", "Wet"] },
+        { id: "dawn", members: ["Dawncharged", "Ambercharged", "Dawnlit", "Amberlit"] }
+      ];
+      const mutationGroupIndex = /* @__PURE__ */ new Map();
+      MUTATION_GROUPS.forEach((group, idx) => {
+        group.members.forEach((name) => mutationGroupIndex.set(name, idx));
+      });
+      const getTileMutations = (obj) => {
+        if (!obj || typeof obj !== "object") return [];
+        const raw = [];
+        if (Array.isArray(obj.glcMutations)) {
+          raw.push(...obj.glcMutations);
+        } else if (typeof obj.glcMutation === "string") {
+          raw.push(obj.glcMutation);
+        }
+        const normalized = /* @__PURE__ */ new Set();
+        for (const mut of raw) {
+          const name = GardenLayoutService.normalizeMutation(String(mut || ""));
+          if (name && mutationCatalog[name]) {
+            normalized.add(name);
+          }
+        }
+        const ordered = [];
+        MUTATION_GROUPS.forEach((group) => {
+          for (const name of group.members) {
+            if (normalized.has(name)) {
+              ordered.push(name);
+              break;
+            }
+          }
+        });
+        return ordered.length ? ordered : Array.from(normalized.values()).slice(0, 3);
+      };
+      const setTileMutations = (obj, mutations) => {
+        if (!obj || typeof obj !== "object") return;
+        const list = (mutations || []).filter(Boolean);
+        if (list.length) {
+          obj.glcMutations = list.slice(0, 3);
+          if (obj.glcMutation) delete obj.glcMutation;
+        } else {
+          if (obj.glcMutations) delete obj.glcMutations;
+          if (obj.glcMutation) delete obj.glcMutation;
+        }
+      };
       const fillSelect = (el2, items, label, getLabel) => {
         el2.innerHTML = "";
         const first = document.createElement("option");
@@ -9859,6 +10397,11 @@
       const windowBody = windowEl?.querySelector(".w-body") ?? null;
       const windowHead = windowEl?.querySelector(".w-head") ?? null;
       const minBtn = windowHead?.querySelector('[data-act="min"]') ?? null;
+      const closeBtn = windowHead?.querySelector('[data-act="close"]') ?? null;
+      const onClose = () => {
+        GardenLayoutService.cancelApply();
+      };
+      closeBtn?.addEventListener("click", onClose);
       let loadoutsHidden = false;
       let layoutsNaturalHeight = 0;
       const measureNaturalHeight = () => {
@@ -10283,13 +10826,14 @@
         renderSavedLayouts();
       };
       const refreshRequirementInfo = async () => {
-        const [list, availability, mutationAvailability, decorAvailability, liveGarden] = await Promise.all([
+        const [list, linkedAvailability, decorAvailability, liveGarden] = await Promise.all([
           GardenLayoutService.getRequirementSummary(draft),
-          GardenLayoutService.getPlantAvailabilityCounts(draft.ignoredTiles),
-          GardenLayoutService.getPlantAvailabilityMutationCounts(draft.ignoredTiles),
+          GardenLayoutService.getLinkedPlantAvailability(draft),
           GardenLayoutService.getDecorAvailabilityCounts(draft.ignoredTiles),
           GardenLayoutService.getCurrentGarden()
         ]);
+        const availability = linkedAvailability.base;
+        const mutationAvailability = linkedAvailability.mutation;
         currentGarden = liveGarden || GardenLayoutService.getEmptyGarden();
         const potRequirement = await GardenLayoutService.getPlanterPotRequirement(draft, currentGarden);
         const nextEggs = {
@@ -10326,9 +10870,9 @@
           const rawSpecies = String(obj.species || obj.seedKey || "");
           const species = GardenLayoutService.resolvePlantSpecies(rawSpecies);
           if (!species) continue;
-          const mutation = typeof obj.glcMutation === "string" ? GardenLayoutService.normalizeMutation(String(obj.glcMutation)) : "";
-          if (mutation) {
-            const key2 = `${species}::${mutation}`;
+          const mutations = getTileMutations(obj);
+          if (mutations.length) {
+            const key2 = `${species}::${mutations.slice().sort((a, b) => a.localeCompare(b)).join("+")}`;
             const used = (plantMutationCounts.get(key2) || 0) + 1;
             plantMutationCounts.set(key2, used);
             const have = mutationAvailability.get(key2) || 0;
@@ -10513,8 +11057,9 @@
         if (!obj || typeof obj !== "object") return;
         const type = String(obj.objectType || "").toLowerCase();
         if (type !== "plant") return;
-        if (!obj.glcMutation) return;
+        if (!obj.glcMutation && !obj.glcMutations) return;
         delete obj.glcMutation;
+        delete obj.glcMutations;
         map[String(idx)] = obj;
         updateTileCell(idx);
         void refreshRequirementInfo();
@@ -10626,8 +11171,21 @@
                 const objType = String(obj2.objectType || "").toLowerCase();
                 if (objType !== "plant") return;
                 const selected = GardenLayoutService.normalizeMutation(mutationSelect.value);
-                if (!selected) delete obj2.glcMutation;
-                else obj2.glcMutation = selected;
+                if (!selected) {
+                  setTileMutations(obj2, []);
+                } else {
+                  let muts = getTileMutations(obj2);
+                  if (muts.includes(selected)) {
+                    muts = muts.filter((m) => m !== selected);
+                  } else {
+                    const groupIdx = mutationGroupIndex.get(selected);
+                    if (groupIdx != null) {
+                      muts = muts.filter((m) => mutationGroupIndex.get(m) !== groupIdx);
+                    }
+                    muts.push(selected);
+                  }
+                  setTileMutations(obj2, muts);
+                }
                 map[String(tile.localIdx)] = obj2;
                 void refreshRequirementInfo();
                 return;
@@ -10639,8 +11197,9 @@
                 delete map[String(tile.localIdx)];
               } else {
                 const prev = map[String(tile.localIdx)];
-                if (obj.objectType === "plant" && prev && typeof prev === "object" && prev.glcMutation) {
-                  obj.glcMutation = prev.glcMutation;
+                if (obj.objectType === "plant" && prev && typeof prev === "object" && (prev.glcMutation || prev.glcMutations)) {
+                  const prevMutations = getTileMutations(prev);
+                  setTileMutations(obj, prevMutations);
                 }
                 map[String(tile.localIdx)] = obj;
               }
@@ -10862,11 +11421,15 @@
           clearIcon.style.display = isMarkedForClear ? "flex" : "none";
         }
         const occupied = !!obj;
-        const mutation = obj && typeof obj === "object" && typeof obj.glcMutation === "string" ? GardenLayoutService.normalizeMutation(String(obj.glcMutation)) : "";
+        const mutations = obj && typeof obj === "object" ? getTileMutations(obj) : [];
         const isMissing = missingPlantTiles.has(idx) || missingDecorTiles.has(`${currentKind}:${idx}`);
         const isSelected = selectedTile === idx || selectedTiles.has(idx);
         cell.style.borderImage = "none";
         cell.style.borderImageSlice = "";
+        cell.style.border = "1px solid rgba(255,255,255,0.12)";
+        cell.style.backgroundImage = "none";
+        cell.style.backgroundOrigin = "";
+        cell.style.backgroundClip = "";
         if (isIgnoredTile(idx)) {
           cell.style.borderColor = "#b266ff";
           cell.style.boxShadow = "0 0 0 2px rgba(178,102,255,0.7) inset";
@@ -10879,21 +11442,31 @@
         } else if (blockedTiles.has(idx)) {
           cell.style.borderColor = "#f5c542";
           cell.style.boxShadow = "0 0 0 2px rgba(245,197,66,0.7) inset";
-        } else if (mutation && MUTATION_OUTLINES[mutation]) {
-          const outline = MUTATION_OUTLINES[mutation];
-          cell.style.borderColor = outline.border;
+        } else if (mutations.length) {
+          const ordered = mutations.slice().sort((a, b) => (mutationGroupIndex.get(a) ?? 0) - (mutationGroupIndex.get(b) ?? 0));
+          const rings = [];
+          let ringIndex = 0;
+          for (const mutation of ordered) {
+            const outline = MUTATION_OUTLINES[mutation];
+            if (!outline) continue;
+            if (mutation === "Rainbow") {
+              cell.style.border = "2px solid transparent";
+              cell.style.borderRadius = "8px";
+              cell.style.backgroundImage = "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
+              cell.style.backgroundOrigin = "border-box";
+              cell.style.backgroundClip = "padding-box, border-box";
+              ringIndex += 1;
+              continue;
+            }
+            const baseWidth = mutation === "Gold" ? 2 : 1;
+            const width = baseWidth + ringIndex;
+            rings.push(`0 0 0 ${width}px ${outline.border} inset`);
+            ringIndex += 1;
+          }
           if (isMissing) {
-            cell.style.boxShadow = `${outline.shadow}, 0 0 8px 2px rgba(255,107,107,0.8)`;
-          } else {
-            cell.style.boxShadow = outline.shadow;
+            rings.push("0 0 8px 2px rgba(255,107,107,0.8)");
           }
-          if (mutation === "Rainbow") {
-            cell.style.border = "2px solid transparent";
-            cell.style.borderRadius = "8px";
-            cell.style.backgroundImage = "linear-gradient(rgba(48, 58, 72, 0.9), rgba(48, 58, 72, 0.9)), linear-gradient(90deg,#ff5a5a,#ffb347,#ffe97b,#8dff8d,#6ecbff,#b28dff)";
-            cell.style.backgroundOrigin = "border-box";
-            cell.style.backgroundClip = "padding-box, border-box";
-          }
+          cell.style.boxShadow = rings.length ? rings.join(", ") : "none";
         } else if (isMissing) {
           cell.style.borderColor = "#ff6b6b";
           cell.style.boxShadow = "0 0 0 2px rgba(255,107,107,0.7) inset";
@@ -10921,6 +11494,7 @@
         const current = await GardenLayoutService.getCurrentGarden();
         if (current && typeof current === "object") {
           draft = stripEggs(current);
+          applyGardenMutationBorders(draft);
           syncIgnoredFromDraft();
           renderGrid();
           void refreshRequirementInfo();
@@ -10930,6 +11504,7 @@
       applyExternalGarden = (garden) => {
         if (garden && typeof garden === "object") {
           draft = stripEggs(garden);
+          applyGardenMutationBorders(draft);
           syncIgnoredFromDraft();
           renderGrid();
           void refreshRequirementInfo();
@@ -10941,7 +11516,9 @@
         if (type !== "plant") return obj;
         const now = Date.now();
         const matureTs = now - 1e3;
-        const mutation = typeof obj.glcMutation === "string" ? GardenLayoutService.normalizeMutation(String(obj.glcMutation)) : "";
+        const speciesId = String(obj.species || obj.seedKey || "");
+        const maxScale = Number(plantCatalog?.[speciesId]?.crop?.maxScale || 1);
+        const mutations = getTileMutations(obj);
         const clone = { ...obj };
         clone.plantedAt = matureTs;
         clone.maturedAt = matureTs;
@@ -10950,8 +11527,8 @@
             ...slot,
             startTime: matureTs,
             endTime: matureTs,
-            targetScale: slot?.targetScale ?? 1,
-            mutations: mutation ? [mutation] : Array.isArray(slot?.mutations) ? slot.mutations : []
+            targetScale: Number.isFinite(maxScale) && maxScale > 0 ? maxScale : slot?.targetScale ?? 1,
+            mutations: mutations.length ? mutations : Array.isArray(slot?.mutations) ? slot.mutations : []
           }));
         }
         return clone;
@@ -11211,6 +11788,7 @@
         if (reqRaf) window.cancelAnimationFrame(reqRaf);
         if (reqRefreshTimer) window.clearInterval(reqRefreshTimer);
         requirementsWin.remove();
+        closeBtn?.removeEventListener("click", onClose);
       };
       resetDraftBtn.addEventListener("click", () => {
         const proceed = window.confirm("Reset the current draft?");
@@ -11310,6 +11888,45 @@
         }
       };
       renderPlantPickerGrid();
+      const applyGardenMutationBorders = (garden) => {
+        const applyToMap = (map) => {
+          for (const obj of Object.values(map || {})) {
+            if (!obj || typeof obj !== "object") continue;
+            const type = String(obj.objectType ?? obj.type ?? "").toLowerCase();
+            if (type !== "plant") continue;
+            const rawMuts = [];
+            if (Array.isArray(obj.slots)) {
+              for (const slot of obj.slots) {
+                if (Array.isArray(slot?.mutations)) {
+                  rawMuts.push(...slot.mutations);
+                }
+              }
+            }
+            if (Array.isArray(obj.mutations)) {
+              rawMuts.push(...obj.mutations);
+            }
+            const normalized = /* @__PURE__ */ new Set();
+            for (const mut of rawMuts) {
+              const name = GardenLayoutService.normalizeMutation(String(mut || ""));
+              if (name && mutationCatalog[name]) {
+                normalized.add(name);
+              }
+            }
+            const selected = [];
+            MUTATION_GROUPS.forEach((group) => {
+              for (const name of group.members) {
+                if (normalized.has(name)) {
+                  selected.push(name);
+                  break;
+                }
+              }
+            });
+            setTileMutations(obj, selected);
+          }
+        };
+        applyToMap(garden?.tileObjects || {});
+        applyToMap(garden?.boardwalkTileObjects || {});
+      };
       plantPickerBtn.addEventListener("click", () => {
         plantPickerGrid.style.display = plantPickerGrid.style.display === "none" ? "grid" : "none";
       });
