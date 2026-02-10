@@ -98,7 +98,13 @@ export const tileRefsPlants = {
     Squash: 60,
     PineTree: 61,
     Poinsettia: 62,
-    Shrub: 63
+    Shrub: 63,
+    CabbagePlant: 64,
+    Cabbage: 65,
+    BabyBeet: 66,
+    Beet: 67,
+    Gentian: 68,
+    VioletCort: 69
 };
 
 export const tileRefsTallPlants = {
@@ -155,7 +161,11 @@ export const tileRefsSeeds = {
     Chrysanthemum: 49,
     Squash: 50,
     Pinecone: 51,
-    Poinsettia: 52
+    Poinsettia: 52,
+    VioletCort: 53,
+    Cabbage: 54,
+    Beet: 55,
+    Gentian: 56
 };
 
 export const tileRefsItems = {
@@ -240,6 +250,8 @@ export const tileRefsMutations = {
   Amberlit: 12,
   Dawncharged: 13,
   Ambercharged: 14,
+  Thunderstruck: 15,
+  ThunderstruckGround: 16,
 };
 
 export const tileRefsMutationLabels = {
@@ -250,7 +262,9 @@ export const tileRefsMutationLabels = {
   Dawnlit: "Dawnlit",
   Amberlit: "Amberlit",
   Dawncharged: "Dawnbound",
-  Ambercharged: "Amberbound"};
+  Ambercharged: "Amberbound",
+  Thunderstruck: "Thunderstruck",
+  ThunderstruckGround: "Thunderstruck"};
 
 export const tileRefsDecor = {
       SmallRock: 11,
@@ -265,6 +279,7 @@ export const tileRefsDecor = {
     WoodStool: 63,
     WoodArch: 33,
     WoodArchSide: 43,
+    WoodPergola: 73,
     WoodBridge: 34,
     WoodBridgeSideways: 44,
     WoodOwl: 53,
@@ -348,6 +363,33 @@ export const plantCatalog = {
     },
   },
 
+  Cabbage: {
+    seed: {
+      tileRef: tileRefsSeeds.Cabbage,
+      name: "Cabbage Seed",
+      coinPrice: 30,
+      creditPrice: 12,
+      rarity: rarity.Common,
+    },
+    plant: {
+      tileRef: tileRefsPlants.CabbagePlant,
+      name: "Cabbage Plant",
+      harvestType: harvestType.Multiple,
+      slotOffsets: [{ x: 0, y: -0.05, rotation: 0 }],
+      secondsToMature: 45,
+      baseTileScale: 1,
+      rotateSlotOffsetsRandomly: false,
+    },
+    crop: {
+      tileRef: tileRefsPlants.Cabbage,
+      name: "Cabbage",
+      baseSellPrice: 42,
+      baseWeight: 1,
+      baseTileScale: 0.8,
+      maxScale: 3,
+    },
+  },
+
   Strawberry: {
     seed: {
       tileRef: tileRefsSeeds.Strawberry,
@@ -378,6 +420,30 @@ export const plantCatalog = {
       baseWeight: 0.05,
       baseTileScale: 0.25,
       maxScale: 2,
+    },
+  },
+
+  Beet: {
+    seed: {
+      tileRef: tileRefsSeeds.Beet,
+      name: "Beet Seed",
+      coinPrice: 210,
+      creditPrice: 25,
+      rarity: rarity.Common,
+    },
+    plant: {
+      tileRef: tileRefsPlants.BabyBeet,
+      name: "Beet Plant",
+      harvestType: harvestType.Single,
+      baseTileScale: 0.7,
+    },
+    crop: {
+      tileRef: tileRefsPlants.Beet,
+      name: "Beet",
+      baseSellPrice: 350,
+      baseWeight: 0.3,
+      baseTileScale: 0.2,
+      maxScale: 3,
     },
   },
 
@@ -713,6 +779,67 @@ export const plantCatalog = {
       baseWeight: 0.8,
       baseTileScale: 0.8,
       maxScale: 2.75,
+    },
+  },
+
+  Pear: {
+    seed: {
+      tileRef: tileRefsSeeds.Pear,
+      name: "Pear Seed",
+      coinPrice: 6e3,
+      creditPrice: 122,
+      rarity: rarity.Rare,
+    },
+    plant: {
+      tileRef: tileRefsPlants.Tree,
+      name: "Pear Tree",
+      harvestType: harvestType.Multiple,
+      slotOffsets: [
+        { x: -0.5, y: -1, rotation: 0 },
+        { x: -0.35, y: -0.4, rotation: 0 },
+        { x: 0.1, y: -0.45, rotation: 0 },
+        { x: 0, y: -0.9, rotation: 0 },
+        { x: 0.4, y: -0.7, rotation: 0 },
+        { x: 0.5, y: -1.1, rotation: 0 },
+        { x: -0.3, y: 1.2, rotation: 0 },
+      ],
+      secondsToMature: 360 * 60,
+      baseTileScale: 3,
+      rotateSlotOffsetsRandomly: true,
+      tileTransformOrigin: "bottom",
+      nudgeY: -0.25,
+    },
+    crop: {
+      tileRef: tileRefsPlants.Pear,
+      name: "Pear",
+      baseSellPrice: 250,
+      baseWeight: 0.17,
+      baseTileScale: 0.5,
+      maxScale: 2,
+    },
+  },
+
+  Gentian: {
+    seed: {
+      tileRef: tileRefsSeeds.Gentian,
+      name: "Gentian Seed",
+      coinPrice: 9e3,
+      creditPrice: 30,
+      rarity: rarity.Rare,
+    },
+    plant: {
+      tileRef: tileRefsPlants.Gentian,
+      name: "Gentian Plant",
+      harvestType: harvestType.Single,
+      baseTileScale: 0.5,
+    },
+    crop: {
+      tileRef: tileRefsPlants.Gentian,
+      name: "Gentian",
+      baseSellPrice: 1e4,
+      baseWeight: 0.02,
+      baseTileScale: 0.5,
+      maxScale: 3,
     },
   },
 
@@ -1061,6 +1188,30 @@ export const plantCatalog = {
             maxScale: 2
         }
     },
+
+  VioletCort: {
+    seed: {
+      tileRef: tileRefsSeeds.VioletCort,
+      name: "Violet Cort Spore",
+      coinPrice: 52e4,
+      creditPrice: 530,
+      rarity: rarity.Mythic,
+    },
+    plant: {
+      tileRef: tileRefsPlants.VioletCort,
+      name: "Violet Cort Plant",
+      harvestType: harvestType.Single,
+      baseTileScale: 0.55,
+    },
+    crop: {
+      tileRef: tileRefsPlants.VioletCort,
+      name: "Violet Cort",
+      baseSellPrice: 6e5,
+      baseWeight: 2,
+      baseTileScale: 0.65,
+      maxScale: 3.5,
+    },
+  },
 
   Chrysanthemum: {
     seed: {
@@ -1489,6 +1640,7 @@ export const mutationCatalog = {
   Wet:        { name: "Wet",         baseChance: 0, coinMultiplier: 2,  tileRef: tileRefsMutations.Wet },
   Chilled:    { name: "Chilled",     baseChance: 0, coinMultiplier: 2,  tileRef: tileRefsMutations.Chilled },
   Frozen:     { name: "Frozen",      baseChance: 0, coinMultiplier: 10, tileRef: tileRefsMutations.Frozen },
+  Thunderstruck: { name: "Thunderstruck", baseChance: 0, coinMultiplier: 5, tileRef: tileRefsMutations.Thunderstruck },
   Dawnlit:    { name: "Dawnlit",     baseChance: 0, coinMultiplier: 2,  tileRef: tileRefsMutations.Dawnlit },
 
   Amberlit: { name: "Amberlit",    baseChance: 0, coinMultiplier: 5,  tileRef: tileRefsMutations.Amberlit },
@@ -2277,6 +2429,16 @@ export const decorCatalog = {
         coinPrice: 500000, creditPrice: 74, rarity: rarity.Common,
         baseTileScale: 1.5,isOneTimePurchase: false, nudgeY: -0.47
     },
+
+  WoodPergola: {
+    tileRef: tileRefsDecor.WoodPergola,
+    name: "Wood Pergola",
+    coinPrice: 3e4,
+    creditPrice: 30,
+    rarity: rarity.Common,
+    baseTileScale: 1,
+    isOneTimePurchase: false,
+  },
 
     StoneCaribou: {
         tileRef: tileRefsDecor.StoneCaribou,
