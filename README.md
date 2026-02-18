@@ -2,13 +2,6 @@
 
 GLC is a simple helper that lets you plan and place your garden layout in Magic Garden.
 
-## Disclaimer
-
-- This Mod uses Planter Pots to shift Garden objects around. Because of how early in development the mod is, there are a few known bugs like infinite repotting loops making you waste planter pots. If that happens close the mod window by pressing the X in the top right while its stuck or reload the page.
-- Your items are 100% safe while using this mod, theres no deletion logic at worst they'll end up in your inventory potted, however as I said your Planter Pots may not be as safe.
-- Use only if you have enough Planter Pots to spare losing some.
-
-
 ## How to use it
 
 - Install the GLC userscript in your browser (Tampermonkey or Violentmonkey).
@@ -38,11 +31,11 @@ This is where you'll find options like **Preview ALL**, **Free Inventory Slots**
 Mutations let you apply special effects to plants (Gold, Rainbow, Frozen, Wet, etc.).
 
 - **Select Mutation mode**: Switch the dropdown from Plant/Decor to **Mutation**.
-- **Pick a mutation**: Choose from the mutation list (Gold, Rainbow, Frozen, Chilled, Wet, Dawnlit, Amberlit, etc.) up to 3 mutations on 1 plant.
+- **Pick a mutation**: Choose from the mutation list (Gold, Rainbow, Frozen, Chilled, Wet, Dawnlit, Amberlit, etc.).
 - **Apply to plants**: Left‑click any plant tile to apply the selected mutation. Hold to apply to multiple.
 - **Remove mutations**: Right‑click a plant tile (in Mutation mode) to remove the mutation without deleting the plant.
-- **Color-coded outlines**: Each mutation shows a unique border color on tiles (Gold = yellow, Rainbow = gradient, Frozen = blue, etc.).
-- **Requirements**: The Requirements window will show you the needed plants/decor for the layout.
+- **Color-coded outlines**: Each mutation shows a unique border color on tiles (Gold = yellow, Rainbow = gradient, Frozen = icy blue, etc.).
+- **Requirements**: The Requirements window will show mutated plants separately (e.g., "Sunflower (Rainbow) 2/5").
 
 ## Ignore Zones
 

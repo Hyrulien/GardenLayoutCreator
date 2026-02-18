@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLC - Garden Layout Creator
 // @namespace    GLC
-// @version      v1.0.5
+// @version      v1.0.6
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -9324,7 +9324,11 @@
   };
   function getSpriteService() {
     const win = pageWindow ?? globalThis;
-    return win?.__MG_SPRITE_SERVICE__ ?? win?.unsafeWindow?.__MG_SPRITE_SERVICE__ ?? null;
+    const glc = win?.__GLC_SPRITE_SERVICE__ ?? win?.unsafeWindow?.__GLC_SPRITE_SERVICE__ ?? null;
+    if (glc) return glc;
+    const legacy = win?.__MG_SPRITE_SERVICE__ ?? win?.unsafeWindow?.__MG_SPRITE_SERVICE__ ?? null;
+    if (legacy?.__modNamespace === "GLC") return legacy;
+    return null;
   }
   var parseKeyToCategoryId = (key) => {
     const parts = key.split("/").filter(Boolean);
@@ -12713,7 +12717,7 @@
       },
       curVariant: () => curVariant(state2)
     };
-    root.MGSpriteCatalog = api;
+    root.GLCSpriteCatalog = api;
     return api;
   }
 
@@ -12747,6 +12751,11 @@
   // src/sprite/index.ts
   var ctx = createSpriteContext();
   var hooks = createPixiHooks();
+  var GLC_SPRITE_OVERLAY_ID = "glc-sprite-overlay";
+  var GLC_SPRITE_STATE_KEY = "__GLC_SPRITE_STATE__";
+  var GLC_SPRITE_CFG_KEY = "__GLC_SPRITE_CFG__";
+  var GLC_SPRITE_API_KEY = "__GLC_SPRITE_API__";
+  var GLC_SPRITE_SERVICE_KEY = "__GLC_SPRITE_SERVICE__";
   var parseFrameCategory = (key) => {
     const parts = String(key || "").split("/").filter(Boolean);
     if (!parts.length) return null;
@@ -13068,7 +13077,7 @@
     const uw = g.unsafeWindow || g;
     const spriteApi = await Promise.resolve().then(() => (init_spriteApi(), spriteApi_exports));
     const ensureOverlayHost = () => {
-      const id = "mg-sprite-overlay";
+      const id = GLC_SPRITE_OVERLAY_ID;
       let host = document.getElementById(id);
       if (!host) {
         host = document.createElement("div");
@@ -13128,6 +13137,7 @@
       }
     };
     const service = {
+      __modNamespace: "GLC",
       ready: Promise.resolve(),
       // overwritten below
       state: ctx.state,
@@ -13192,7 +13202,7 @@
         return { wrap, canvas: c };
       },
       clearOverlay() {
-        const host = document.getElementById("mg-sprite-overlay");
+        const host = document.getElementById(GLC_SPRITE_OVERLAY_ID);
         if (host) host.remove();
       },
       renderAnimToCanvases(params) {
@@ -13207,17 +13217,17 @@
       }
     };
     service.ready = Promise.resolve();
-    uw.__MG_SPRITE_STATE__ = ctx.state;
-    uw.__MG_SPRITE_CFG__ = ctx.cfg;
-    uw.__MG_SPRITE_API__ = spriteApi;
-    uw.__MG_SPRITE_SERVICE__ = service;
-    uw.getSpriteWithMutations = service.getSpriteWithMutations;
-    uw.getBaseSprite = service.getBaseSprite;
-    uw.buildSpriteVariant = service.buildVariant;
-    uw.listSpritesByCategory = service.list;
-    uw.renderSpriteToCanvas = service.renderToCanvas;
-    uw.renderSpriteToDataURL = service.renderToDataURL;
-    uw.MG_SPRITE_HELPERS = service;
+    uw[GLC_SPRITE_STATE_KEY] = ctx.state;
+    uw[GLC_SPRITE_CFG_KEY] = ctx.cfg;
+    uw[GLC_SPRITE_API_KEY] = spriteApi;
+    uw[GLC_SPRITE_SERVICE_KEY] = service;
+    uw.glcGetSpriteWithMutations = service.getSpriteWithMutations;
+    uw.glcGetBaseSprite = service.getBaseSprite;
+    uw.glcBuildSpriteVariant = service.buildVariant;
+    uw.glcListSpritesByCategory = service.list;
+    uw.glcRenderSpriteToCanvas = service.renderToCanvas;
+    uw.glcRenderSpriteToDataURL = service.renderToDataURL;
+    uw.GLC_SPRITE_HELPERS = service;
     console.log("[GLC Sprites] ready", {
       version: ctx.state.version,
       pixi: version,

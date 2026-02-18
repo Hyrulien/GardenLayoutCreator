@@ -13,6 +13,11 @@ import { gameVersion as globalGameVersion, initGameVersion } from '../utils/game
 
 const ctx = createSpriteContext();
 const hooks = createPixiHooks();
+const GLC_SPRITE_OVERLAY_ID = 'glc-sprite-overlay';
+const GLC_SPRITE_STATE_KEY = '__GLC_SPRITE_STATE__';
+const GLC_SPRITE_CFG_KEY = '__GLC_SPRITE_CFG__';
+const GLC_SPRITE_API_KEY = '__GLC_SPRITE_API__';
+const GLC_SPRITE_SERVICE_KEY = '__GLC_SPRITE_SERVICE__';
 
 type PrefetchedAtlas = {
   base: string;
@@ -403,7 +408,7 @@ async function start() {
   const spriteApi = await import('./api/spriteApi');
 
   const ensureOverlayHost = () => {
-    const id = 'mg-sprite-overlay';
+    const id = GLC_SPRITE_OVERLAY_ID;
     let host = document.getElementById(id);
     if (!host) {
       host = document.createElement('div');
@@ -471,6 +476,7 @@ async function start() {
   };
 
   const service = {
+    __modNamespace: 'GLC',
     ready: Promise.resolve(), // overwritten below
     state: ctx.state,
     cfg: ctx.cfg,
@@ -553,7 +559,7 @@ async function start() {
       return { wrap, canvas: c };
     },
     clearOverlay() {
-      const host = document.getElementById('mg-sprite-overlay');
+      const host = document.getElementById(GLC_SPRITE_OVERLAY_ID);
       if (host) host.remove();
     },
     renderAnimToCanvases(params: any) {
@@ -570,18 +576,18 @@ async function start() {
 
   service.ready = Promise.resolve();
 
-  uw.__MG_SPRITE_STATE__ = ctx.state;
-  uw.__MG_SPRITE_CFG__ = ctx.cfg;
-  uw.__MG_SPRITE_API__ = spriteApi;
-  uw.__MG_SPRITE_SERVICE__ = service;
-  // Convenience bindings for console/other modules
-  uw.getSpriteWithMutations = service.getSpriteWithMutations;
-  uw.getBaseSprite = service.getBaseSprite;
-  uw.buildSpriteVariant = service.buildVariant;
-  uw.listSpritesByCategory = service.list;
-  uw.renderSpriteToCanvas = service.renderToCanvas;
-  uw.renderSpriteToDataURL = service.renderToDataURL;
-  uw.MG_SPRITE_HELPERS = service;
+  uw[GLC_SPRITE_STATE_KEY] = ctx.state;
+  uw[GLC_SPRITE_CFG_KEY] = ctx.cfg;
+  uw[GLC_SPRITE_API_KEY] = spriteApi;
+  uw[GLC_SPRITE_SERVICE_KEY] = service;
+  // Convenience bindings for console/other modules (GLC namespaced to avoid cross-mod collisions).
+  uw.glcGetSpriteWithMutations = service.getSpriteWithMutations;
+  uw.glcGetBaseSprite = service.getBaseSprite;
+  uw.glcBuildSpriteVariant = service.buildVariant;
+  uw.glcListSpritesByCategory = service.list;
+  uw.glcRenderSpriteToCanvas = service.renderToCanvas;
+  uw.glcRenderSpriteToDataURL = service.renderToDataURL;
+  uw.GLC_SPRITE_HELPERS = service;
 
 console.log('[GLC Sprites] ready', {
     version: ctx.state.version,

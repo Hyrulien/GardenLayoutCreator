@@ -162,7 +162,19 @@ const scheduleNonBlocking = <T>(cb: () => T | Promise<T>): Promise<T> => {
 
 function getSpriteService(): SpriteServiceHandle | null {
   const win: any = pageWindow ?? (globalThis as any);
-  return win?.__MG_SPRITE_SERVICE__ ?? win?.unsafeWindow?.__MG_SPRITE_SERVICE__ ?? null;
+  const glc =
+    win?.__GLC_SPRITE_SERVICE__ ??
+    win?.unsafeWindow?.__GLC_SPRITE_SERVICE__ ??
+    null;
+  if (glc) return glc;
+
+  // Legacy fallback: only accept old key if it was published by GLC itself.
+  const legacy =
+    win?.__MG_SPRITE_SERVICE__ ??
+    win?.unsafeWindow?.__MG_SPRITE_SERVICE__ ??
+    null;
+  if (legacy?.__modNamespace === "GLC") return legacy;
+  return null;
 }
 
 const parseKeyToCategoryId = (key: string): { category: string; id: string } | null => {

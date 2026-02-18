@@ -54,6 +54,6 @@ export function exposeApi(state: SpriteState, hud: HudHandles) {
     },
     curVariant: () => curVariant(state),
   };
-  root.MGSpriteCatalog = api;
+  root.GLCSpriteCatalog = api;
   return api;
 }
